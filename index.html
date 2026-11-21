@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#f5f5f7" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#121316" media="(prefers-color-scheme: dark)">
+  <title>Drink Tracker</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <h1>Drink Tracker</h1>
+    <div class="topbar-actions">
+      <button id="settingsBtn" class="btn ghost" type="button" aria-label="Settings and backup">⚙︎ Settings</button>
+      <button id="addBtn" class="btn primary" type="button">+ Add drink</button>
+    </div>
+  </header>
+
+  <!-- Category tabs (rendered by app.js) -->
+  <nav id="tabs" class="tabs" aria-label="Categories"></nav>
+
+  <!-- Filters and sorting -->
+  <section class="filters" aria-label="Filter and sort">
+    <label class="f-search">
+      <span>Search</span>
+      <input id="search" type="search" placeholder="Name…" autocomplete="off">
+    </label>
+    <label>
+      <span>Min rating</span>
+      <select id="minRating"></select>
+    </label>
+    <label>
+      <span>Max price / l</span>
+      <input id="maxPerLiter" type="text" inputmode="decimal" placeholder="any" autocomplete="off">
+    </label>
+    <label>
+      <span>Sort by</span>
+      <select id="sort">
+        <option value="date">Date added (newest)</option>
+        <option value="rating">Rating (best)</option>
+        <option value="perLiter">Price per liter (cheapest)</option>
+        <option value="perAlcoholLiter">Price per liter alcohol (cheapest)</option>
+        <option value="name">Name (A–Z)</option>
+      </select>
+    </label>
+  </section>
+
+  <p id="summary" class="summary" aria-live="polite"></p>
+  <main id="list" class="list"></main>
+  <p id="empty" class="empty" hidden>No drinks match. Add one with “+ Add drink”.</p>
+
+  <!-- Add / edit drink -->
+  <dialog id="drinkDialog" class="sheet">
+    <form id="drinkForm" novalidate>
+      <header class="sheet-head">
+        <h2 id="drinkTitle">Add drink</h2>
+        <button type="button" class="btn ghost icon" data-close aria-label="Close">✕</button>
+      </header>
+
+      <div class="sheet-body">
+        <div class="field">
+          <label for="fName">Name *</label>
+          <input id="fName" type="text" maxlength="120" autocomplete="off">
+          <small class="err" data-err="name"></small>
+        </div>
+
+        <div class="row2">
+          <div class="field">
+            <label for="fCategory">Category *</label>
+            <select id="fCategory"></select>
+            <small class="err" data-err="tabId"></small>
+          </div>
+          <div class="field">
+            <label for="fBrand">Brand / producer</label>
+            <input id="fBrand" type="text" maxlength="120" autocomplete="off">
+          </div>
+        </div>
+
+        <div class="field">
+          <span class="label" id="ratingLabel">Rating *</span>
+          <div class="rating-input" role="radiogroup" aria-labelledby="ratingLabel">
+            <div id="stars" class="stars"></div>
+            <output id="ratingOut" class="rating-out">–/10</output>
+          </div>
+          <input id="fRating" type="hidden" value="0">
+          <small class="err" data-err="rating"></small>
+        </div>
+
+        <div class="row3">
+          <div class="field">
+            <label for="fPrice">Price paid</label>
+            <input id="fPrice" type="text" inputmode="decimal" placeholder="0.00" autocomplete="off">
+            <small class="err" data-err="price"></small>
+          </div>
+          <div class="field">
+            <label for="fVolume">Volume</label>
+            <div class="joined">
+              <input id="fVolume" type="text" inputmode="decimal" placeholder="750" autocomplete="off">
+              <select id="fUnit" aria-label="Volume unit">
+                <option value="ml">ml</option>
+                <option value="l">l</option>
+              </select>
+            </div>
+            <small class="err" data-err="volume"></small>
+          </div>
+          <div class="field">
+            <label for="fAbv">ABV %</label>
+            <input id="fAbv" type="text" inputmode="decimal" placeholder="13" autocomplete="off">
+            <small class="err" data-err="abv"></small>
+          </div>
+        </div>
+
+        <!-- Live price calculation -->
+        <div class="calc" aria-live="polite">
+          <div><span>Price per liter</span><strong id="calcPerLiter">–</strong></div>
+          <div><span>Price per liter alcohol</span><strong id="calcPerAlc">–</strong></div>
+        </div>
+
+        <div class="field">
+          <span class="label">Photo</span>
+          <div class="photo-row">
+            <div id="photoPreview" class="photo-preview"><span>No photo</span></div>
+            <div class="photo-buttons">
+              <button type="button" class="btn" data-pick="photoCamera">📷 Take photo</button>
+              <button type="button" class="btn" data-pick="photoGallery">🖼 Choose image</button>
+              <button type="button" class="btn ghost danger" id="photoRemove" hidden>Remove photo</button>
+              <small id="photoBusy" class="muted" hidden>Processing image…</small>
+            </div>
+          </div>
+          <input id="photoCamera" type="file" accept="image/*" capture="environment" hidden>
+          <input id="photoGallery" type="file" accept="image/*" hidden>
+        </div>
+
+        <div class="field">
+          <label for="fNotes">Notes</label>
+          <textarea id="fNotes" rows="3" maxlength="2000"></textarea>
+        </div>
+      </div>
+
+      <footer class="sheet-foot">
+        <button type="button" id="deleteDrinkBtn" class="btn ghost danger" hidden>Delete</button>
+        <span class="spacer"></span>
+        <button type="button" class="btn ghost" data-close>Cancel</button>
+        <button type="submit" id="saveDrinkBtn" class="btn primary">Save</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <!-- Full-size photo -->
+  <dialog id="imageDialog" class="viewer">
+    <img id="viewerImg" alt="">
+    <p id="viewerCaption"></p>
+    <button type="button" class="btn" data-close>Close</button>
+  </dialog>
+
+  <!-- Manage tabs -->
+  <dialog id="tabsDialog" class="sheet small">
+    <header class="sheet-head">
+      <h2>Edit tabs</h2>
+      <button type="button" class="btn ghost icon" data-close aria-label="Close">✕</button>
+    </header>
+    <div class="sheet-body">
+      <p class="muted">Rename a tab by editing its name. “All” always shows every drink.</p>
+      <ul id="tabList" class="tab-list"></ul>
+      <form id="addTabForm" class="add-tab">
+        <input id="newTabName" type="text" maxlength="30" placeholder="New tab name" aria-label="New tab name" autocomplete="off">
+        <button type="submit" class="btn primary">Add</button>
+      </form>
+      <small id="tabError" class="err"></small>
+    </div>
+  </dialog>
+
+  <!-- Confirm tab deletion -->
+  <dialog id="deleteTabDialog" class="sheet small">
+    <header class="sheet-head"><h2>Delete tab?</h2></header>
+    <div class="sheet-body">
+      <p id="delTabText"></p>
+      <label id="delTabMove" class="field">
+        <span>Move its drinks to</span>
+        <select id="delTabTarget"></select>
+      </label>
+    </div>
+    <footer class="sheet-foot">
+      <span class="spacer"></span>
+      <button type="button" class="btn ghost" data-close>Cancel</button>
+      <button type="button" id="delTabConfirm" class="btn danger-solid">Delete tab</button>
+    </footer>
+  </dialog>
+
+  <!-- Settings + backup -->
+  <dialog id="settingsDialog" class="sheet small">
+    <header class="sheet-head">
+      <h2>Settings</h2>
+      <button type="button" class="btn ghost icon" data-close aria-label="Close">✕</button>
+    </header>
+    <div class="sheet-body">
+      <div class="field">
+        <label for="currency">Currency symbol</label>
+        <input id="currency" type="text" maxlength="5" autocomplete="off">
+      </div>
+      <h3>Backup</h3>
+      <p class="muted">Data lives only in this browser. Export regularly to keep a copy (photos included).</p>
+      <div class="btn-row">
+        <button type="button" id="exportBtn" class="btn">⬇ Export JSON</button>
+        <button type="button" id="importBtn" class="btn">⬆ Import JSON</button>
+        <input id="importFile" type="file" accept="application/json,.json" hidden>
+      </div>
+      <p class="muted">Import replaces all current data.</p>
+    </div>
+  </dialog>
+
+  <script src="app.js"></script>
+</body>
+</html>
