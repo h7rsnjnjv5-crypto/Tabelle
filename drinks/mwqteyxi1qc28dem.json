@@ -1,7 +1,7 @@
 {
   "id": "mwqteyxi1qc28dem",
   "name": "Hell",
-  "tabId": "mwqrykniitztkksz",
+  "tabId": "mwqrykni64s6b6rl",
   "brand": "Keesmann",
   "notes": "",
   "rating": 5,
@@ -15,6 +15,6 @@
   "lng": 10.8868478,
   "geoQuery": "Bamberg, Deutschland",
   "createdAt": 1795290172758,
-  "updatedAt": 1795290172758,
+  "updatedAt": 1795290178864,
   "hasPhoto": false
 }
