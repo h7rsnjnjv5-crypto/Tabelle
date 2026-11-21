@@ -1,0 +1,34 @@
+{
+  "app": "drink-tracker",
+  "version": 1,
+  "settings": {
+    "currency": "€"
+  },
+  "tabs": [
+    {
+      "id": "mwqrykniitztkksz",
+      "name": "Wine",
+      "order": 0
+    },
+    {
+      "id": "mwqrykni64s6b6rl",
+      "name": "Beer",
+      "order": 1
+    },
+    {
+      "id": "mwqrykni1gp954aa",
+      "name": "Liqueur",
+      "order": 2
+    },
+    {
+      "id": "mwqryknix13jazyk",
+      "name": "Spirits",
+      "order": 3
+    },
+    {
+      "id": "mwqryknjev9xpvpw",
+      "name": "Other",
+      "order": 4
+    }
+  ]
+}
