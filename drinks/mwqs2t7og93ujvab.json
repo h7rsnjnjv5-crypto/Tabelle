@@ -1,0 +1,20 @@
+{
+  "id": "mwqs2t7og93ujvab",
+  "name": "Glühwein Weineck",
+  "tabId": "mwqrykniitztkksz",
+  "brand": "Hauser Weinimport",
+  "notes": "",
+  "rating": 7,
+  "price": 1.8,
+  "volume": 750,
+  "volumeUnit": "ml",
+  "abv": 10,
+  "country": "Deutschland",
+  "region": "Fischach",
+  "lat": 48.2902043,
+  "lng": 10.6554555,
+  "geoQuery": "Fischach, Deutschland",
+  "createdAt": 1795287925860,
+  "updatedAt": 1795289794012,
+  "hasPhoto": true
+}
