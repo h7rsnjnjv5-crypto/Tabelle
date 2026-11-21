@@ -407,7 +407,7 @@ async function init() {
   renderAll();
   renderSyncStatus();
   showView(viewFromHash());
-  if (syncEnabled() && queueSize() > 0) runSync(); // finish uploads from last time
+  requestPull(); // finish uploads from last time and fetch changes from other devices
   registerServiceWorker();
 }
 
@@ -1010,7 +1010,40 @@ const sync = {
   branchReady: false,
   error: '',
   retryTimer: null,
+  // What this device last saw on GitHub: file path -> git sha, plus folder shas.
+  // Used to download only what changed and to detect deletions.
+  remote: { root: {}, files: {} },
+  forcePull: false,
+  lastPull: 0,
+  lastSyncedAt: 0,
 };
+
+const PULL_EVERY_MS = 120000; // check for changes from other devices every 2 minutes while open
+
+function saveRemoteState() {
+  return putAll('meta', [{ key: 'syncState', root: sync.remote.root, files: sync.remote.files }]);
+}
+
+function resetRemoteState() {
+  sync.remote = { root: {}, files: {} };
+  sync.lastPull = 0;
+}
+
+/** Ask for a download of changes from other devices (and upload pending ones). */
+function requestPull() {
+  if (!syncEnabled()) return;
+  sync.forcePull = true;
+  runSync();
+}
+
+/** Decide what to do with a drink that changed on GitHub. The most recent edit wins.
+ *  A drink still waiting to upload is left alone here: the upload step already
+ *  compared it with GitHub and either uploaded it or gave way to a newer edit. */
+function pullAction(local, remoteUpdatedAt, locallyChanged) {
+  if (locallyChanged) return 'keep';
+  if (!local) return 'add';
+  return (remoteUpdatedAt || 0) > (local.updatedAt || 0) ? 'update' : 'keep';
+}
 
 function syncEnabled() {
   return Boolean(sync.cfg.repo && sync.cfg.token);
@@ -1034,7 +1067,7 @@ async function queueSync({ config = false, drinkIds = [] }) {
   runSync();
 }
 
-/** Upload queued changes one by one until the queue is empty. */
+/** Upload queued changes one by one, then download changes from other devices. */
 async function runSync() {
   if (!syncEnabled() || sync.running) return;
   clearTimeout(sync.retryTimer);
@@ -1059,6 +1092,12 @@ async function runSync() {
       await saveQueue();
       renderSyncStatus();
     }
+    if (sync.forcePull || Date.now() - sync.lastPull > PULL_EVERY_MS / 2) {
+      sync.forcePull = false;
+      await pullRemote();
+      sync.lastPull = Date.now();
+    }
+    sync.lastSyncedAt = Date.now();
   } catch (err) {
     sync.error = err.message;
     sync.retryTimer = setTimeout(runSync, 60000);
@@ -1066,12 +1105,147 @@ async function runSync() {
     sync.running = false;
     renderSyncStatus();
   }
-  if (!sync.error && queueSize() > 0) runSync();
+  if (!sync.error && (queueSize() > 0 || sync.forcePull)) runSync();
+}
+
+async function listDir(path) {
+  const list = await gh('GET', contentsPath(path), { allow404: true });
+  return (Array.isArray(list) ? list : []).filter((f) => f.type === 'file');
+}
+
+/** Download what changed on GitHub since the last check and merge it into this device. */
+async function pullRemote() {
+  const rootList = await gh('GET', `/repos/${sync.cfg.repo}/contents?ref=${encodeURIComponent(sync.cfg.branch)}`, { allow404: true });
+  const entry = (name) => (Array.isArray(rootList) ? rootList : []).find((e) => e.name === name);
+  const files = sync.remote.files;
+  let changed = false;
+
+  // Tabs + currency
+  const cfgEntry = entry('config.json');
+  if (cfgEntry && cfgEntry.sha !== files['config.json']) {
+    if (!sync.queue.config) {
+      const cfg = await (await gh('GET', contentsPath('config.json'), { raw: true })).json();
+      if (await applyRemoteConfig(cfg)) changed = true;
+    }
+    files['config.json'] = cfgEntry.sha;
+  }
+
+  // Drinks + photos (only listed when their folder changed)
+  const drinksSha = entry('drinks') ? entry('drinks').sha : null;
+  const photosSha = entry('photos') ? entry('photos').sha : null;
+  if (drinksSha !== sync.remote.root.drinks || photosSha !== sync.remote.root.photos) {
+    const remoteDrinks = new Map((drinksSha ? await listDir('drinks') : [])
+      .filter((f) => f.name.endsWith('.json')).map((f) => [f.name.slice(0, -5), f.sha]));
+    const remotePhotos = new Map((photosSha ? await listDir('photos') : [])
+      .filter((f) => f.name.endsWith('.jpg')).map((f) => [f.name.slice(0, -4), f.sha]));
+
+    for (const [id, sha] of remoteDrinks) {
+      const path = `drinks/${id}.json`;
+      const photoPath = `photos/${id}.jpg`;
+      const photoSha = remotePhotos.get(id) || null;
+      if (sha === files[path] && photoSha === (files[photoPath] || null)) continue; // unchanged
+      const local = state.drinks.find((d) => d.id === id);
+      const dirty = id in sync.queue.drinks;
+      const raw = await (await gh('GET', contentsPath(path), { raw: true })).json();
+      const action = pullAction(local, raw.updatedAt, dirty);
+      if (action !== 'keep') {
+        let photo = null;
+        let thumb = null;
+        if (raw.hasPhoto && photoSha) {
+          if (local && local.photo && photoSha === files[photoPath]) {
+            photo = local.photo; // photo unchanged, keep ours
+            thumb = local.thumb;
+          } else {
+            const res = await gh('GET', contentsPath(photoPath), { raw: true, allow404: true });
+            if (res) {
+              photo = new Blob([await res.arrayBuffer()], { type: 'image/jpeg' });
+              thumb = await resizeImage(photo, 320, 0.8);
+            }
+          }
+        }
+        let drink;
+        try {
+          drink = parseBackup({ tabs: state.tabs, drinks: [raw] }).drinks[0];
+        } catch (e) {
+          continue; // invalid file on GitHub: ignore it, keep local data
+        }
+        drink.photo = photo;
+        drink.thumb = thumb;
+        await putAll('drinks', [drink]);
+        state.drinks = local ? state.drinks.map((d) => (d.id === id ? drink : d)) : [...state.drinks, drink];
+        changed = true;
+      }
+      files[path] = sha;
+      if (photoSha) files[photoPath] = photoSha; else delete files[photoPath];
+    }
+
+    // Deleted on another device: only drinks this device had seen on GitHub before.
+    const gone = state.drinks.filter((d) => !remoteDrinks.has(d.id) && files[`drinks/${d.id}.json`] && !(d.id in sync.queue.drinks));
+    for (const d of gone) {
+      await deleteKey('drinks', d.id);
+      delete files[`drinks/${d.id}.json`];
+      delete files[`photos/${d.id}.jpg`];
+      changed = true;
+    }
+    if (gone.length) state.drinks = state.drinks.filter((d) => !gone.includes(d));
+
+    // Local drinks GitHub has never seen (e.g. made before connecting): upload them.
+    const unsent = state.drinks.filter((d) => !remoteDrinks.has(d.id) && !files[`drinks/${d.id}.json`] && !(d.id in sync.queue.drinks));
+    unsent.forEach((d) => { sync.queue.drinks[d.id] = 1; });
+    if (unsent.length) await saveQueue();
+
+    sync.remote.root = { drinks: drinksSha, photos: photosSha };
+  }
+  await saveRemoteState();
+  if (changed) {
+    renderAll();
+    if ($('#tabsDialog').open) renderTabsDialog();
+  }
+}
+
+/** Apply tabs and currency from GitHub. Drinks of removed tabs are moved, never dropped. */
+async function applyRemoteConfig(cfg) {
+  let parsed;
+  try {
+    parsed = parseBackup({ tabs: (cfg && cfg.tabs) || [], settings: cfg && cfg.settings, drinks: [] });
+  } catch (e) {
+    return false;
+  }
+  if (!cfg || !Array.isArray(cfg.tabs) || cfg.tabs.length === 0) return false;
+  const same = JSON.stringify(parsed.tabs) === JSON.stringify(state.tabs) && parsed.settings.currency === state.settings.currency;
+  if (same) return false;
+  const ids = new Set(parsed.tabs.map((t) => t.id));
+  const target = fallbackTabId(parsed.tabs);
+  const moved = state.drinks.filter((d) => !ids.has(d.tabId)).map((d) => Object.assign({}, d, { tabId: target }));
+  const t = db.transaction(['tabs', 'drinks', 'meta'], 'readwrite');
+  t.objectStore('tabs').clear();
+  parsed.tabs.forEach((x) => t.objectStore('tabs').put(x));
+  moved.forEach((d) => t.objectStore('drinks').put(d));
+  t.objectStore('meta').put({ key: 'settings', currency: parsed.settings.currency });
+  await txDone(t);
+  const movedById = new Map(moved.map((d) => [d.id, d]));
+  state.tabs = parsed.tabs;
+  state.drinks = state.drinks.map((d) => movedById.get(d.id) || d);
+  state.settings.currency = parsed.settings.currency;
+  if (state.tab !== ALL && !ids.has(state.tab)) state.tab = ALL;
+  moved.forEach((d) => { sync.queue.drinks[d.id] = (sync.queue.drinks[d.id] || 0) + 1; });
+  if (moved.length) await saveQueue();
+  return true;
 }
 
 async function syncDrink(id) {
   const d = state.drinks.find((x) => x.id === id);
   if (d) {
+    // Conflict check: did another device change this drink since we last saw it?
+    const path = `drinks/${id}.json`;
+    const current = await remoteSha(path);
+    if (current && current !== sync.remote.files[path]) {
+      const remote = await (await gh('GET', contentsPath(path), { raw: true })).json();
+      if ((remote.updatedAt || 0) > (d.updatedAt || 0)) {
+        sync.forcePull = true; // the newer edit from the other device wins; download it instead
+        return;
+      }
+    }
     await putFile(`drinks/${id}.json`, jsonBytes(drinkToRemote(d)), `Save drink “${d.name}”`);
     if (d.photo) await putFile(`photos/${id}.jpg`, new Uint8Array(await d.photo.arrayBuffer()), `Save photo of “${d.name}”`);
     else await deleteFile(`photos/${id}.jpg`, 'Remove photo');
@@ -1156,16 +1330,21 @@ async function remoteSha(path) {
 
 async function putFile(path, bytes, message) {
   const sha = await remoteSha(path);
-  if (sha && sha === await gitBlobSha(bytes)) return; // unchanged
-  await gh('PUT', `/repos/${sync.cfg.repo}/contents/${path}`, {
+  if (sha && sha === await gitBlobSha(bytes)) { sync.remote.files[path] = sha; return; } // unchanged
+  const res = await gh('PUT', `/repos/${sync.cfg.repo}/contents/${path}`, {
     body: { message, content: bytesToBase64(bytes), branch: sync.cfg.branch, sha: sha || undefined },
   });
+  // Remember our own upload, so the next download check skips it.
+  if (res && res.content && res.content.sha) sync.remote.files[path] = res.content.sha;
+  await saveRemoteState();
 }
 
 async function deleteFile(path, message) {
   const sha = await remoteSha(path);
+  delete sync.remote.files[path];
   if (!sha) return;
   await gh('DELETE', `/repos/${sync.cfg.repo}/contents/${path}`, { body: { message, sha, branch: sync.cfg.branch } });
+  await saveRemoteState();
 }
 
 /** Create the data branch from the default branch if it does not exist yet. */
@@ -1226,6 +1405,9 @@ async function restoreFromGitHub(askFirst = true) {
     await replaceAllData(parsed);
     sync.queue = { config: false, drinks: {} }; // local now equals remote
     await saveQueue();
+    resetRemoteState();
+    await saveRemoteState();
+    requestPull(); // records what is on GitHub; unchanged drinks are not applied again
     renderSyncStatus();
     msg.textContent = 'Restore complete.';
   } catch (err) {
@@ -1248,6 +1430,8 @@ async function loadSyncConfig() {
   const queue = meta.find((m) => m.key === 'syncQueue');
   if (cfg) sync.cfg = { repo: cfg.repo || '', branch: cfg.branch || 'data', token: cfg.token || '' };
   if (queue) sync.queue = { config: Boolean(queue.config), drinks: queue.drinks || {} };
+  const remote = meta.find((m) => m.key === 'syncState');
+  if (remote) sync.remote = { root: remote.root || {}, files: remote.files || {} };
 }
 
 function fillSyncForm() {
@@ -1268,6 +1452,8 @@ async function connectGitHub() {
   const previous = sync.cfg;
   sync.cfg = { repo, branch, token };
   sync.branchReady = false;
+  const previousRemote = sync.remote;
+  if (firstTime) resetRemoteState();
   msg.textContent = 'Connecting…';
   try {
     const info = await gh('GET', `/repos/${repo}`);
@@ -1278,17 +1464,20 @@ async function connectGitHub() {
     fillSyncForm();
     if (firstTime) {
       const remoteIds = await listRemoteDrinkIds();
-      if (remoteIds.length && confirm(`GitHub already has ${remoteIds.length} saved drinks.\n\nOK = load them onto this device (replaces the data here).\nCancel = keep the data here and add it to GitHub.`)) {
+      if (remoteIds.length && confirm(`GitHub already has ${remoteIds.length} saved drinks.\n\nOK = load them onto this device (replaces the data here).\nCancel = merge: keep the data here and combine it with GitHub.`)) {
         await restoreFromGitHub(false);
         renderSyncStatus();
         return;
       }
+      await saveRemoteState();
       await uploadEverything();
+      requestPull();
     } else {
-      runSync();
+      requestPull();
     }
   } catch (err) {
     sync.cfg = previous; // keep the old working connection (if any) and what was typed
+    sync.remote = previousRemote;
     sync.branchReady = false;
     msg.textContent = 'Could not connect: ' + err.message;
   }
@@ -1300,6 +1489,8 @@ async function disconnectGitHub() {
   sync.cfg = { repo: '', branch: 'data', token: '' };
   sync.queue = { config: false, drinks: {} };
   sync.branchReady = false;
+  resetRemoteState();
+  await saveRemoteState();
   clearTimeout(sync.retryTimer);
   await putAll('meta', [{ key: 'sync', repo: '', branch: 'data', token: '' }]);
   await saveQueue();
@@ -1314,9 +1505,11 @@ function renderSyncStatus() {
   b.hidden = !syncEnabled();
   b.classList.toggle('error', Boolean(sync.error));
   const n = queueSize();
-  if (sync.error) b.textContent = `⚠ Not saved to GitHub (${n}) – tap to retry`;
+  if (sync.error) b.textContent = n ? `⚠ Not saved to GitHub (${n}) – tap to retry` : '⚠ GitHub sync failed – tap to retry';
   else if (n > 0) b.textContent = `☁ Saving to GitHub… (${n})`;
-  else b.textContent = '☁ Saved to GitHub';
+  else if (sync.running) b.textContent = '☁ Syncing…';
+  else if (sync.lastSyncedAt) b.textContent = `☁ Synced ${new Date(sync.lastSyncedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
+  else b.textContent = '☁ GitHub';
   b.title = sync.error || '';
 }
 
@@ -1329,8 +1522,11 @@ function bindSyncEvents() {
     $('#ghMsg').textContent = sync.error ? 'Upload failed: ' + sync.error : 'Upload started – see status at the top.';
   });
   $('#ghRestore').addEventListener('click', () => restoreFromGitHub(true));
-  $('#syncStatus').addEventListener('click', () => { if (sync.error) runSync(); else openSettings(); });
-  window.addEventListener('online', runSync);
+  $('#syncStatus').addEventListener('click', () => { if (sync.error) requestPull(); else openSettings(); });
+  // Automatic download: on return to the app, when back online, and every 2 minutes while open.
+  window.addEventListener('online', requestPull);
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') requestPull(); });
+  setInterval(() => { if (document.visibilityState === 'visible') requestPull(); }, PULL_EVERY_MS);
 }
 
 /* =====================================================================
@@ -2146,7 +2342,7 @@ function registerServiceWorker() {
 /* ---------- Boot ---------- */
 
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { parseNumber, roundMoney, toLiters, calcPrices, validateDrink, applyView, pickBestValue, validateTabName, parseBackup, fallbackTabId, gitBlobSha, bytesToBase64, drinkToRemote,
+  module.exports = { parseNumber, roundMoney, toLiters, calcPrices, validateDrink, applyView, pickBestValue, validateTabName, parseBackup, fallbackTabId, pullAction, gitBlobSha, bytesToBase64, drinkToRemote,
     sanitizeAiResult, extractJson, parseLabelText, findCountry, drinkPosition, groupForMap, countCountries, geoQueryFor, AI_MODEL };
 }
 if (typeof document !== 'undefined') init();

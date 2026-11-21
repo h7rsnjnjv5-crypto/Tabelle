@@ -121,6 +121,16 @@ test('free label reading: ABV and volume only when unambiguous', () => {
   assert.deepStrictEqual(L(null), { abv: null, volumeMl: null, conflicting: false });
 });
 
+test('auto-download: newer edit wins, pending uploads are not overwritten', () => {
+  const local = { id: 'x', updatedAt: 100 };
+  assert.strictEqual(app.pullAction(null, 50, false), 'add');
+  assert.strictEqual(app.pullAction(local, 200, false), 'update');
+  assert.strictEqual(app.pullAction(local, 100, false), 'keep');
+  assert.strictEqual(app.pullAction(local, 50, false), 'keep');
+  assert.strictEqual(app.pullAction(local, 999, true), 'keep');
+  assert.strictEqual(app.pullAction(null, 999, true), 'keep');
+});
+
 (async () => {
   // Same hashes as `git hash-object`
   assert.strictEqual(await app.gitBlobSha(new Uint8Array(0)), 'e69de29bb2d1d6434b8b29ae775ad8c2e48c5391');

@@ -55,7 +55,13 @@ Settings → **Save to GitHub** saves every new, edited or deleted entry automat
 2. In the app enter the repository (`owner/name`), keep branch `data`, paste the token, tap **Save & connect**.
 
 Files on the `data` branch: `drinks/<id>.json`, `photos/<id>.jpg`, `config.json` (tabs + currency).
-Changes made offline are queued and uploaded later (status next to the title).
+
+**Automatic upload and download** – connect every device to the same repository and they stay in sync:
+- Every add, edit and delete is uploaded right away. Changes made offline are queued and uploaded later.
+- Changes from other devices are downloaded automatically: when the app opens, when you switch back to it,
+  when the connection returns, and every 2 minutes while it is open. Only changed drinks/photos are downloaded.
+- If the same drink was edited on two devices, the most recent edit wins. A drink deleted on one device is removed on the others.
+- The status next to the title shows "☁ Synced 14:32", "Saving…" or a warning (tap to retry).
 **If the repository is public, the data and photos are public too** — use a private repository for private data.
 
 ## Files
