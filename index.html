@@ -4,149 +4,211 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="color-scheme" content="light dark">
-  <meta name="theme-color" content="#f5f5f7" media="(prefers-color-scheme: light)">
-  <meta name="theme-color" content="#121316" media="(prefers-color-scheme: dark)">
+  <meta name="theme-color" content="#F2F2F7" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="Drinks">
   <title>Drink Tracker</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon-192.png" type="image/png">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <header class="topbar">
-    <h1>Drink Tracker</h1>
-    <div class="topbar-actions">
-      <button id="settingsBtn" class="btn ghost" type="button" aria-label="Settings and backup">⚙︎ Settings</button>
-      <button id="addBtn" class="btn primary" type="button">+ Add drink</button>
+  <!-- ============ Drinks ============ -->
+  <section id="view-drinks" class="view" data-view="drinks">
+    <header class="navbar">
+      <span class="nav-title">Drinks</span>
+    </header>
+    <div class="large-title-row">
+      <h1 class="large-title">Drinks</h1>
+      <button id="syncStatus" class="sync-status" type="button" hidden></button>
     </div>
-  </header>
 
-  <button id="syncStatus" class="sync-status" type="button" hidden></button>
+    <div class="toolbar">
+      <input id="search" class="searchfield" type="search" placeholder="Search" autocomplete="off" aria-label="Search by name">
+      <nav id="tabs" class="pills" aria-label="Categories"></nav>
+      <div class="filter-row" aria-label="Filter and sort">
+        <label class="chip"><span>Rating</span><select id="minRating"></select></label>
+        <label class="chip"><span>Max /l</span><input id="maxPerLiter" type="text" inputmode="decimal" placeholder="any" autocomplete="off" aria-label="Maximum price per liter"></label>
+        <label class="chip"><span>Sort</span>
+          <select id="sort">
+            <option value="date">Newest</option>
+            <option value="rating">Rating</option>
+            <option value="perLiter">Price / l</option>
+            <option value="perAlcoholLiter">Price / l alcohol</option>
+            <option value="name">Name</option>
+          </select>
+        </label>
+      </div>
+    </div>
 
-  <!-- Category tabs (rendered by app.js) -->
-  <nav id="tabs" class="tabs" aria-label="Categories"></nav>
-
-  <!-- Filters and sorting -->
-  <section class="filters" aria-label="Filter and sort">
-    <label class="f-search">
-      <span>Search</span>
-      <input id="search" type="search" placeholder="Name…" autocomplete="off">
-    </label>
-    <label>
-      <span>Min rating</span>
-      <select id="minRating"></select>
-    </label>
-    <label>
-      <span>Max price / l</span>
-      <input id="maxPerLiter" type="text" inputmode="decimal" placeholder="any" autocomplete="off">
-    </label>
-    <label>
-      <span>Sort by</span>
-      <select id="sort">
-        <option value="date">Date added (newest)</option>
-        <option value="rating">Rating (best)</option>
-        <option value="perLiter">Price per liter (cheapest)</option>
-        <option value="perAlcoholLiter">Price per liter alcohol (cheapest)</option>
-        <option value="name">Name (A–Z)</option>
-      </select>
-    </label>
+    <p id="summary" class="section-footer" aria-live="polite"></p>
+    <ul id="list" class="inset-list drink-list"></ul>
+    <p id="empty" class="empty" hidden>No drinks here yet.<br>Tap <strong>+</strong> to add one.</p>
   </section>
 
-  <p id="summary" class="summary" aria-live="polite"></p>
-  <main id="list" class="list"></main>
-  <p id="empty" class="empty" hidden>No drinks match. Add one with “+ Add drink”.</p>
+  <!-- ============ Map ============ -->
+  <section id="view-map" class="view" data-view="map" hidden>
+    <header class="navbar">
+      <span class="nav-title">Map</span>
+    </header>
+    <div class="large-title-row"><h1 class="large-title">Map</h1></div>
+    <div class="toolbar">
+      <nav id="mapChips" class="pills" aria-label="Map categories"></nav>
+    </div>
+    <p id="mapStats" class="section-header"></p>
+    <div class="map-wrap"><div id="map" class="map" role="region" aria-label="Map of drink origins"></div></div>
+    <p id="mapMsg" class="section-footer"></p>
+  </section>
 
-  <!-- Add / edit drink -->
+  <!-- ============ Settings ============ -->
+  <section id="view-settings" class="view" data-view="settings" hidden>
+    <header class="navbar">
+      <span class="nav-title">Settings</span>
+    </header>
+    <div class="large-title-row"><h1 class="large-title">Settings</h1></div>
+
+    <h2 class="section-header">General</h2>
+    <div class="group">
+      <label class="frow"><span>Currency</span><input id="currency" type="text" maxlength="5" autocomplete="off"></label>
+      <button type="button" id="editTabsBtn" class="frow link-row">Categories<span class="chev" aria-hidden="true"></span></button>
+    </div>
+
+    <h2 class="section-header">Identify drinks with AI</h2>
+    <div class="group">
+      <label class="frow"><span>API key</span><input id="aiKey" type="password" placeholder="sk-ant-…" autocomplete="off" spellcheck="false" autocapitalize="off"></label>
+      <label class="frow"><span>Web search</span><input id="aiWebSearch" type="checkbox" class="switch"></label>
+    </div>
+    <p class="section-footer">Personal use only: your Anthropic API key is stored on this device and sent only to api.anthropic.com
+      when you tap “Identify drink”. Usage is billed to your Anthropic account. Web search lets the AI look up ABV and origin of an identified product.</p>
+
+    <h2 class="section-header">Save to GitHub</h2>
+    <div class="group">
+      <label class="frow"><span>Repository</span><input id="ghRepo" type="text" placeholder="owner/name" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
+      <label class="frow"><span>Branch</span><input id="ghBranch" type="text" placeholder="data" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
+      <label class="frow"><span>Token</span><input id="ghToken" type="password" autocomplete="off" spellcheck="false"></label>
+      <button type="button" id="ghConnect" class="frow link-row accent">Save &amp; connect</button>
+      <span id="ghConnected" class="contents" hidden>
+        <button type="button" id="ghUploadAll" class="frow link-row accent">Upload everything</button>
+        <button type="button" id="ghRestore" class="frow link-row accent">Restore from GitHub</button>
+        <button type="button" id="ghDisconnect" class="frow link-row danger">Disconnect</button>
+      </span>
+    </div>
+    <p id="ghMsg" class="section-footer strong" aria-live="polite"></p>
+    <p class="section-footer">Saves every entry and photo automatically to a branch of a GitHub repository.
+      If the repository is <strong>public, anyone can see your drinks and photos</strong> – use a private one.
+      Token: fine-grained, this repository only, “Contents: Read and write”
+      (<a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">create</a>). Stored only on this device.</p>
+
+    <h2 class="section-header">Backup</h2>
+    <div class="group">
+      <button type="button" id="exportBtn" class="frow link-row accent">Export JSON</button>
+      <button type="button" id="importBtn" class="frow link-row accent">Import JSON…</button>
+      <input id="importFile" type="file" accept="application/json,.json" hidden>
+    </div>
+    <p class="section-footer">Data is stored in this browser. Export regularly to keep a copy (photos included). Import replaces all current data.</p>
+  </section>
+
+  <!-- ============ Bottom tab bar ============ -->
+  <nav class="tabbar" aria-label="Sections">
+    <button type="button" class="tab-item" data-go="drinks">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3h10l-1 7a4 4 0 0 1-3 3.9V19h3v2H8v-2h3v-5.1A4 4 0 0 1 8 10L7 3zm2.2 2 .6 4.6a2.2 2.2 0 0 0 4.4 0L14.8 5H9.2z"/></svg>
+      <span>Drinks</span>
+    </button>
+    <button type="button" class="tab-item" data-go="map">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2a7 7 0 0 1 7 7c0 5-7 13-7 13S5 14 5 9a7 7 0 0 1 7-7zm0 4.5a2.5 2.5 0 1 0 0 5 2.5 2.5 0 0 0 0-5z"/></svg>
+      <span>Map</span>
+    </button>
+    <button type="button" class="tab-item add" id="addBtn">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 7v10M7 12h10" stroke="#fff" stroke-width="2.2" stroke-linecap="round"/></svg>
+      <span>Add</span>
+    </button>
+    <button type="button" class="tab-item" data-go="settings">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M13.7 2l.5 2.6a7.8 7.8 0 0 1 1.9 1.1l2.5-.9 1.7 3-2 1.7a7.9 7.9 0 0 1 0 2.2l2 1.7-1.7 3-2.5-.9a7.8 7.8 0 0 1-1.9 1.1l-.5 2.6h-3.4l-.5-2.6a7.8 7.8 0 0 1-1.9-1.1l-2.5.9-1.7-3 2-1.7a7.9 7.9 0 0 1 0-2.2l-2-1.7 1.7-3 2.5.9a7.8 7.8 0 0 1 1.9-1.1l.5-2.6h3.4zM12 8.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7z"/></svg>
+      <span>Settings</span>
+    </button>
+  </nav>
+
+  <!-- ============ Add / edit drink (sheet) ============ -->
   <dialog id="drinkDialog" class="sheet">
     <form id="drinkForm" novalidate>
       <header class="sheet-head">
-        <h2 id="drinkTitle">Add drink</h2>
-        <button type="button" class="btn ghost icon" data-close aria-label="Close">✕</button>
+        <button type="button" class="text-btn" data-close>Cancel</button>
+        <h2 id="drinkTitle">New Drink</h2>
+        <button type="submit" id="saveDrinkBtn" class="text-btn bold">Save</button>
       </header>
 
       <div class="sheet-body">
-        <div class="field">
-          <label for="fName">Name *</label>
-          <input id="fName" type="text" maxlength="120" autocomplete="off">
-          <small class="err" data-err="name"></small>
-        </div>
-
-        <div class="row2">
-          <div class="field">
-            <label for="fCategory">Category *</label>
-            <select id="fCategory"></select>
-            <small class="err" data-err="tabId"></small>
-          </div>
-          <div class="field">
-            <label for="fBrand">Brand / producer</label>
-            <input id="fBrand" type="text" maxlength="120" autocomplete="off">
-          </div>
-        </div>
-
-        <div class="field">
-          <span class="label" id="ratingLabel">Rating *</span>
-          <div class="rating-input" role="radiogroup" aria-labelledby="ratingLabel">
-            <div id="stars" class="stars"></div>
-            <output id="ratingOut" class="rating-out">–/10</output>
-          </div>
-          <input id="fRating" type="hidden" value="0">
-          <small class="err" data-err="rating"></small>
-        </div>
-
-        <div class="row3">
-          <div class="field">
-            <label for="fPrice">Price paid</label>
-            <input id="fPrice" type="text" inputmode="decimal" placeholder="0.00" autocomplete="off">
-            <small class="err" data-err="price"></small>
-          </div>
-          <div class="field">
-            <label for="fVolume">Volume</label>
-            <div class="joined">
-              <input id="fVolume" type="text" inputmode="decimal" placeholder="750" autocomplete="off">
-              <select id="fUnit" aria-label="Volume unit">
-                <option value="ml">ml</option>
-                <option value="l">l</option>
-              </select>
-            </div>
-            <small class="err" data-err="volume"></small>
-          </div>
-          <div class="field">
-            <label for="fAbv">ABV %</label>
-            <input id="fAbv" type="text" inputmode="decimal" placeholder="13" autocomplete="off">
-            <small class="err" data-err="abv"></small>
-          </div>
-        </div>
-
-        <!-- Live price calculation -->
-        <div class="calc" aria-live="polite">
-          <div><span>Price per liter</span><strong id="calcPerLiter">–</strong></div>
-          <div><span>Price per liter alcohol</span><strong id="calcPerAlc">–</strong></div>
-        </div>
-
-        <div class="field">
-          <span class="label">Photo</span>
-          <div class="photo-row">
+        <div class="group photo-group">
+          <div class="photo-top">
             <div id="photoPreview" class="photo-preview"><span>No photo</span></div>
-            <div class="photo-buttons">
-              <button type="button" class="btn" data-pick="photoCamera">📷 Take photo</button>
-              <button type="button" class="btn" data-pick="photoGallery">🖼 Choose image</button>
-              <button type="button" class="btn ghost danger" id="photoRemove" hidden>Remove photo</button>
-              <small id="photoBusy" class="muted" hidden>Processing image…</small>
+            <div class="photo-actions">
+              <button type="button" class="pill-btn" data-pick="photoCamera">Take Photo</button>
+              <button type="button" class="pill-btn" data-pick="photoGallery">Choose Photo</button>
+              <button type="button" class="pill-btn danger" id="photoRemove" hidden>Remove</button>
             </div>
           </div>
+          <small id="photoBusy" class="hint" hidden>Processing image…</small>
+          <button type="button" id="identifyBtn" class="fill-btn" hidden>✨ Identify drink</button>
+          <p id="aiMsg" class="hint" aria-live="polite" hidden></p>
+          <div id="aiSources" class="sources" hidden></div>
           <input id="photoCamera" type="file" accept="image/*" capture="environment" hidden>
           <input id="photoGallery" type="file" accept="image/*" hidden>
         </div>
 
-        <div class="field">
-          <label for="fNotes">Notes</label>
-          <textarea id="fNotes" rows="3" maxlength="2000"></textarea>
+        <div class="group">
+          <label class="frow"><span>Name</span><input id="fName" type="text" maxlength="120" placeholder="Required" autocomplete="off"></label>
+          <label class="frow"><span>Category</span><select id="fCategory"></select></label>
+          <label class="frow"><span>Producer</span><input id="fBrand" type="text" maxlength="120" placeholder="Optional" autocomplete="off"></label>
+        </div>
+        <small class="err" data-err="name"></small>
+        <small class="err" data-err="tabId"></small>
+
+        <h3 class="section-header" id="ratingLabel">Rating</h3>
+        <div class="group">
+          <div class="frow rating-row" role="radiogroup" aria-labelledby="ratingLabel">
+            <div id="stars" class="stars"></div>
+            <output id="ratingOut" class="rating-out">–/10</output>
+          </div>
+          <input id="fRating" type="hidden" value="0">
+        </div>
+        <small class="err" data-err="rating"></small>
+
+        <h3 class="section-header">Price</h3>
+        <div class="group">
+          <label class="frow"><span>Price paid</span><input id="fPrice" type="text" inputmode="decimal" placeholder="0.00" autocomplete="off"></label>
+          <div class="frow">
+            <label for="fVolume">Volume</label>
+            <input id="fVolume" type="text" inputmode="decimal" placeholder="750" autocomplete="off">
+            <select id="fUnit" class="unit" aria-label="Volume unit"><option value="ml">ml</option><option value="l">l</option></select>
+          </div>
+          <label class="frow"><span>ABV %</span><input id="fAbv" type="text" inputmode="decimal" placeholder="13" autocomplete="off"></label>
+          <div class="frow calc"><span>Price per liter</span><strong id="calcPerLiter">–</strong></div>
+          <div class="frow calc"><span>Per liter alcohol</span><strong id="calcPerAlc">–</strong></div>
+        </div>
+        <small class="err" data-err="price"></small>
+        <small class="err" data-err="volume"></small>
+        <small class="err" data-err="abv"></small>
+
+        <h3 class="section-header">Origin</h3>
+        <div class="group">
+          <label class="frow"><span>Country</span><input id="fCountry" type="text" list="countryList" maxlength="80" placeholder="Optional" autocomplete="off"></label>
+          <label class="frow"><span>Region / City</span><input id="fRegion" type="text" maxlength="80" placeholder="Optional" autocomplete="off"></label>
+        </div>
+        <datalist id="countryList"></datalist>
+
+        <h3 class="section-header">Notes</h3>
+        <div class="group">
+          <textarea id="fNotes" class="notes" rows="3" maxlength="2000" aria-label="Notes"></textarea>
+        </div>
+
+        <div class="group" id="deleteDrinkGroup">
+          <button type="button" id="deleteDrinkBtn" class="frow link-row danger center" hidden>Delete Drink</button>
         </div>
       </div>
-
-      <footer class="sheet-foot">
-        <button type="button" id="deleteDrinkBtn" class="btn ghost danger" hidden>Delete</button>
-        <span class="spacer"></span>
-        <button type="button" class="btn ghost" data-close>Cancel</button>
-        <button type="submit" id="saveDrinkBtn" class="btn primary">Save</button>
-      </footer>
     </form>
   </dialog>
 
@@ -154,90 +216,49 @@
   <dialog id="imageDialog" class="viewer">
     <img id="viewerImg" alt="">
     <p id="viewerCaption"></p>
-    <button type="button" class="btn" data-close>Close</button>
+  </dialog>
+
+  <!-- Drinks at one map pin -->
+  <dialog id="groupDialog" class="sheet short">
+    <header class="sheet-head">
+      <span></span>
+      <h2 id="groupTitle"></h2>
+      <button type="button" class="text-btn bold" data-close>Done</button>
+    </header>
+    <div class="sheet-body"><ul id="groupList" class="inset-list"></ul></div>
   </dialog>
 
   <!-- Manage tabs -->
-  <dialog id="tabsDialog" class="sheet small">
+  <dialog id="tabsDialog" class="sheet short">
     <header class="sheet-head">
-      <h2>Edit tabs</h2>
-      <button type="button" class="btn ghost icon" data-close aria-label="Close">✕</button>
+      <span></span>
+      <h2>Categories</h2>
+      <button type="button" class="text-btn bold" data-close>Done</button>
     </header>
     <div class="sheet-body">
-      <p class="muted">Rename a tab by editing its name. “All” always shows every drink.</p>
-      <ul id="tabList" class="tab-list"></ul>
-      <form id="addTabForm" class="add-tab">
-        <input id="newTabName" type="text" maxlength="30" placeholder="New tab name" aria-label="New tab name" autocomplete="off">
-        <button type="submit" class="btn primary">Add</button>
+      <p class="section-footer">Tap a name to rename it. “All” always shows every drink.</p>
+      <ul id="tabList" class="group tab-list"></ul>
+      <form id="addTabForm" class="group">
+        <div class="frow">
+          <input id="newTabName" type="text" maxlength="30" placeholder="New category" aria-label="New category name" autocomplete="off" class="left">
+          <button type="submit" class="text-btn bold">Add</button>
+        </div>
       </form>
-      <small id="tabError" class="err"></small>
+      <p id="tabError" class="section-footer err-text"></p>
     </div>
   </dialog>
 
   <!-- Confirm tab deletion -->
-  <dialog id="deleteTabDialog" class="sheet small">
-    <header class="sheet-head"><h2>Delete tab?</h2></header>
-    <div class="sheet-body">
-      <p id="delTabText"></p>
-      <label id="delTabMove" class="field">
-        <span>Move its drinks to</span>
-        <select id="delTabTarget"></select>
-      </label>
-    </div>
-    <footer class="sheet-foot">
-      <span class="spacer"></span>
-      <button type="button" class="btn ghost" data-close>Cancel</button>
-      <button type="button" id="delTabConfirm" class="btn danger-solid">Delete tab</button>
-    </footer>
-  </dialog>
-
-  <!-- Settings + backup -->
-  <dialog id="settingsDialog" class="sheet small">
-    <header class="sheet-head">
-      <h2>Settings</h2>
-      <button type="button" class="btn ghost icon" data-close aria-label="Close">✕</button>
-    </header>
-    <div class="sheet-body">
-      <div class="field">
-        <label for="currency">Currency symbol</label>
-        <input id="currency" type="text" maxlength="5" autocomplete="off">
-      </div>
-      <h3>Backup</h3>
-      <p class="muted">Data is stored in this browser. Export regularly to keep a copy (photos included).</p>
-      <div class="btn-row">
-        <button type="button" id="exportBtn" class="btn">⬇ Export JSON</button>
-        <button type="button" id="importBtn" class="btn">⬆ Import JSON</button>
-        <input id="importFile" type="file" accept="application/json,.json" hidden>
-      </div>
-      <p class="muted">Import replaces all current data.</p>
-
-      <h3>Save to GitHub</h3>
-      <p class="muted">Saves every entry (and its photo) automatically to a GitHub repository, on its own branch.
-        If the repository is <strong>public, anyone can see your drinks and photos</strong> – use a private repository for private data.</p>
-      <div class="field">
-        <label for="ghRepo">Repository (owner/name)</label>
-        <input id="ghRepo" type="text" placeholder="owner/repository" autocomplete="off" autocapitalize="off" spellcheck="false">
-      </div>
-      <div class="field">
-        <label for="ghBranch">Branch for the data</label>
-        <input id="ghBranch" type="text" placeholder="data" autocomplete="off" autocapitalize="off" spellcheck="false">
-      </div>
-      <div class="field">
-        <label for="ghToken">Access token</label>
-        <input id="ghToken" type="password" autocomplete="off" spellcheck="false">
-        <small class="muted">A fine-grained token for this repository only, with “Contents: Read and write”.
-          <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">Create a token</a>.
-          It is stored only on this device and never exported.</small>
-      </div>
-      <div class="btn-row">
-        <button type="button" id="ghConnect" class="btn primary">Save &amp; connect</button>
-        <span id="ghConnected" class="btn-row" hidden>
-          <button type="button" id="ghUploadAll" class="btn">Upload everything</button>
-          <button type="button" id="ghRestore" class="btn">Restore from GitHub</button>
-          <button type="button" id="ghDisconnect" class="btn ghost danger">Disconnect</button>
-        </span>
-      </div>
-      <p id="ghMsg" class="muted" aria-live="polite"></p>
+  <dialog id="deleteTabDialog" class="alert">
+    <h2>Delete category?</h2>
+    <p id="delTabText"></p>
+    <label id="delTabMove" class="alert-field">
+      <span>Move its drinks to</span>
+      <select id="delTabTarget"></select>
+    </label>
+    <div class="alert-buttons">
+      <button type="button" class="text-btn" data-close>Cancel</button>
+      <button type="button" id="delTabConfirm" class="text-btn bold danger">Delete</button>
     </div>
   </dialog>
 

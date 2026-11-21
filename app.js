@@ -1,6 +1,11 @@
 /* Drink Tracker – vanilla JS, all data stored locally in IndexedDB. */
 'use strict';
 
+/** Claude model used for "Identify drink". Change it here. */
+const AI_MODEL = 'claude-opus-5-5';
+const AI_TIMEOUT_MS = 120000;
+const LEAFLET_URL = 'https://unpkg.com/leaflet@1.9.4/dist/';
+
 /* =====================================================================
    Pure helpers (no DOM). Also loaded by test.js under Node.
    ===================================================================== */
@@ -71,8 +76,16 @@ function validateDrink(f) {
       volume: Number.isNaN(volume) ? null : volume,
       volumeUnit: f.volumeUnit === 'l' ? 'l' : 'ml',
       abv: Number.isNaN(abv) ? null : abv,
+      country: cleanText(f.country, 80),
+      region: cleanText(f.region, 80),
     },
   };
+}
+
+/** Trimmed, length-limited text, or null when empty. */
+function cleanText(v, max) {
+  const s = typeof v === 'string' ? v.trim().slice(0, max) : '';
+  return s || null;
 }
 
 /** Filter + sort drinks. Each returned row = drink + computed perLiter/perAlcoholLiter. */
@@ -169,6 +182,8 @@ function parseBackup(data) {
       volume: d.volume === null || d.volume === undefined ? '' : String(d.volume),
       abv: d.abv === null || d.abv === undefined ? '' : String(d.abv),
       volumeUnit: d.volumeUnit,
+      country: d.country,
+      region: d.region,
     };
     const { errors, values } = validateDrink(raw);
     const keys = Object.keys(errors);
@@ -181,6 +196,10 @@ function parseBackup(data) {
       thumb: isImg(d.thumb) ? d.thumb : (isImg(d.photo) ? d.photo : null),
       createdAt: Number.isFinite(d.createdAt) ? d.createdAt : Date.now(),
       updatedAt: Number.isFinite(d.updatedAt) ? d.updatedAt : Date.now(),
+      // Cached geocoding result (only kept if it looks valid)
+      lat: validLatLng(d.lat, d.lng) ? d.lat : null,
+      lng: validLatLng(d.lat, d.lng) ? d.lng : null,
+      geoQuery: validLatLng(d.lat, d.lng) && typeof d.geoQuery === 'string' ? d.geoQuery : null,
     });
   });
 
@@ -189,28 +208,47 @@ function parseBackup(data) {
   return { tabs, drinks, settings: { currency } };
 }
 
+function validLatLng(lat, lng) {
+  return Number.isFinite(lat) && Number.isFinite(lng) && Math.abs(lat) <= 90 && Math.abs(lng) <= 180;
+}
+
 /* =====================================================================
    IndexedDB layer
    ===================================================================== */
 
 const DB_NAME = 'drink-tracker';
-const DB_VERSION = 1;
+const DB_VERSION = 2; // v2: origin fields (country, region, lat, lng, geoQuery)
 let db = null;
 
 function openDb() {
   return new Promise((resolve, reject) => {
     if (!('indexedDB' in globalThis)) return reject(new Error('IndexedDB is not available in this browser.'));
     const req = indexedDB.open(DB_NAME, DB_VERSION);
-    req.onupgradeneeded = () => {
+    req.onupgradeneeded = (e) => {
       const d = req.result;
       if (!d.objectStoreNames.contains('tabs')) d.createObjectStore('tabs', { keyPath: 'id' });
       if (!d.objectStoreNames.contains('drinks')) d.createObjectStore('drinks', { keyPath: 'id' });
       if (!d.objectStoreNames.contains('meta')) d.createObjectStore('meta', { keyPath: 'key' });
+      if (e.oldVersion >= 1 && e.oldVersion < 2) {
+        // Add the new origin fields to existing drinks; nothing else changes.
+        req.transaction.objectStore('drinks').openCursor().onsuccess = (ev) => {
+          const cursor = ev.target.result;
+          if (!cursor) return;
+          cursor.update(withOriginFields(cursor.value));
+          cursor.continue();
+        };
+      }
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
     req.onblocked = () => reject(new Error('Database is blocked by another open tab. Close other tabs and reload.'));
   });
+}
+
+/** Make sure a drink record has all v2 fields. */
+function withOriginFields(d) {
+  ['country', 'region', 'lat', 'lng', 'geoQuery'].forEach((k) => { if (d[k] === undefined) d[k] = null; });
+  return d;
 }
 
 /** Resolves when a transaction has committed. */
@@ -307,6 +345,9 @@ const state = {
   formPhoto: null, // Blob of the photo currently in the form
   formThumb: null,
   deletingTabId: null,
+  view: 'drinks',
+  mapTab: ALL,
+  categoryTouched: false,
 };
 const thumbUrls = new Map(); // drink id -> { blob, url } for list thumbnails
 let previewUrl = null;
@@ -345,6 +386,7 @@ async function init() {
     db = await openDb();
     await loadAll();
     await loadSyncConfig();
+    await loadAiConfig();
   } catch (err) {
     document.body.prepend(el('p', { class: 'err' }, 'Could not open local storage: ' + err.message));
     return;
@@ -354,9 +396,12 @@ async function init() {
   buildStaticUi();
   bindEvents();
   bindSyncEvents();
+  bindLargeTitles();
   renderAll();
   renderSyncStatus();
+  showView(viewFromHash());
   if (syncEnabled() && queueSize() > 0) runSync(); // finish uploads from last time
+  registerServiceWorker();
 }
 
 async function loadAll() {
@@ -377,7 +422,7 @@ async function loadAll() {
   }
   const settings = meta.find((m) => m.key === 'settings');
   state.tabs = tabs;
-  state.drinks = drinks;
+  state.drinks = drinks.map(withOriginFields);
   state.settings.currency = (settings && settings.currency) || '€';
 }
 
@@ -393,11 +438,16 @@ function buildStaticUi() {
     const b = el('button', { type: 'button', class: 'star', role: 'radio', 'aria-checked': 'false', 'aria-label': `${i} of 10`, 'data-value': String(i) }, '★');
     stars.append(b);
   }
+
+  // Country suggestions for the origin field
+  $('#countryList').replaceChildren(...COUNTRIES.map((c) => el('option', { value: c[0] })));
 }
 
 function bindEvents() {
   $('#addBtn').addEventListener('click', () => openDrinkDialog(null));
-  $('#settingsBtn').addEventListener('click', openSettings);
+  document.querySelectorAll('[data-go]').forEach((b) => b.addEventListener('click', () => showView(b.dataset.go)));
+  window.addEventListener('hashchange', () => showView(viewFromHash()));
+  $('#editTabsBtn').addEventListener('click', openTabsDialog);
 
   // Filters re-render the list
   ['#search', '#minRating', '#sort', '#maxPerLiter'].forEach((s) => $(s).addEventListener('input', renderList));
@@ -422,6 +472,25 @@ function bindEvents() {
   $('#photoGallery').addEventListener('change', (e) => onPhotoChosen(e.target));
   $('#photoRemove').addEventListener('click', () => { state.formPhoto = null; state.formThumb = null; renderPhotoPreview(); });
   $('#deleteDrinkBtn').addEventListener('click', deleteDrink);
+  $('#identifyBtn').addEventListener('click', identifyDrink);
+  $('#fCategory').addEventListener('change', () => { state.categoryTouched = true; });
+  // Editing an AI-filled field removes its highlight
+  $('#drinkForm').addEventListener('input', (e) => {
+    const row = e.target.closest('.frow');
+    if (row) row.classList.remove('ai-filled');
+  });
+  // Tap outside an opened swipe row closes it
+  document.addEventListener('pointerdown', (e) => {
+    if (openSwipeRow && !openSwipeRow.contains(e.target)) closeSwipe(openSwipeRow);
+  });
+  $('#groupList').addEventListener('click', (e) => {
+    const b = e.target.closest('[data-id]');
+    if (b) { $('#groupDialog').close(); openDrinkDialog(b.dataset.id); }
+  });
+
+  // AI settings
+  $('#aiKey').addEventListener('change', saveAiConfig);
+  $('#aiWebSearch').addEventListener('change', saveAiConfig);
 
   // Image viewer: click anywhere to close, free the object URL afterwards
   $('#imageDialog').addEventListener('click', () => $('#imageDialog').close());
@@ -451,6 +520,7 @@ function bindEvents() {
 function renderAll() {
   renderTabs();
   renderList();
+  if (state.view === 'map') renderMap();
 }
 
 function renderTabs() {
@@ -458,12 +528,12 @@ function renderTabs() {
   const counts = {};
   state.drinks.forEach((d) => { counts[d.tabId] = (counts[d.tabId] || 0) + 1; });
   const make = (id, name, count) => {
-    const b = el('button', { type: 'button', class: 'tab', 'aria-pressed': String(state.tab === id) },
+    const b = el('button', { type: 'button', class: 'pill', 'aria-pressed': String(state.tab === id) },
       name, el('span', { class: 'count' }, String(count)));
     b.addEventListener('click', () => { state.tab = id; renderAll(); });
     return b;
   };
-  const edit = el('button', { type: 'button', class: 'tab edit' }, '✎ Edit tabs');
+  const edit = el('button', { type: 'button', class: 'pill edit' }, 'Edit');
   edit.addEventListener('click', openTabsDialog);
   nav.replaceChildren(make(ALL, 'All', state.drinks.length),
     ...state.tabs.map((t) => make(t.id, t.name, counts[t.id] || 0)), edit);
@@ -486,10 +556,11 @@ function readFilters() {
 function renderList() {
   const rows = applyView(state.drinks, readFilters());
   const bestId = rows.length > 1 ? pickBestValue(rows) : null;
-  $('#list').replaceChildren(...rows.map((d) => drinkCard(d, d.id === bestId)));
+  openSwipeRow = null;
+  $('#list').replaceChildren(...rows.map((d) => drinkRow(d, d.id === bestId)));
   $('#empty').hidden = rows.length > 0;
   $('#summary').textContent = `${rows.length} of ${state.drinks.length} drink${state.drinks.length === 1 ? '' : 's'}`
-    + (bestId ? ' · Best value = highest rating per price per liter' : '');
+    + (bestId ? ' · “Best value” = highest rating per price per liter' : '');
   pruneThumbUrls();
 }
 
@@ -511,40 +582,50 @@ function pruneThumbUrls() {
   }
 }
 
-function drinkCard(d, isBest) {
-  const card = el('article', { class: 'card' + (isBest ? ' best' : ''), tabindex: '0', 'aria-label': `Edit ${d.name}` });
-
+/** One list row: photo, name, details, prices, rating. Swipe left to delete. */
+function drinkRow(d, isBest) {
   let thumb;
   if (d.thumb) {
     thumb = el('button', { type: 'button', class: 'thumb', 'aria-label': `Show photo of ${d.name}` },
       el('img', { src: thumbUrl(d), alt: '', loading: 'lazy' }));
-    thumb.addEventListener('click', (e) => { e.stopPropagation(); showImage(d); });
+    thumb.addEventListener('click', (e) => { e.stopPropagation(); if (!swipeJustEnded) showImage(d); });
   } else {
     thumb = el('div', { class: 'thumb', 'aria-hidden': 'true' }, '🍷');
   }
 
-  const sub = [tabName(d.tabId), d.brand].filter(Boolean).join(' · ');
+  const sub = [tabName(d.tabId), d.brand, d.country].filter(Boolean).join(' · ');
   const details = [
     d.volume ? `${NUM.format(d.volume)} ${d.volumeUnit}` : null,
     d.abv !== null && d.abv !== undefined ? `${NUM.format(d.abv)} %` : null,
   ].filter(Boolean).join(' · ');
+  const price = (label, v) => (typeof v === 'number' ? el('span', {}, label ? label + ' ' : '', el('b', {}, money(v))) : null);
+  const prices = [price('', d.price), price('/l', d.perLiter), price('/l alc.', d.perAlcoholLiter)].filter(Boolean);
 
-  const stat = (label, value) => el('div', {}, el('dt', {}, label), el('dd', {}, value));
-  card.append(thumb, el('div', { class: 'info' },
-    el('h3', {}, d.name, isBest ? el('span', { class: 'badge' }, 'Best value') : null),
-    el('p', { class: 'meta' }, sub + (details ? ` · ${details}` : '')),
-    el('div', { class: 'stars-small', 'aria-label': `Rating ${d.rating} of 10` },
-      '★', el('span', { class: 'num' }, `${d.rating}/10`)),
-    el('dl', { class: 'prices' },
-      stat('Price', money(d.price)),
-      stat('Per liter', money(d.perLiter)),
-      stat('Per liter alc.', money(d.perAlcoholLiter)))));
+  const row = el('div', { class: 'drink-row', tabindex: '0', role: 'button', 'aria-label': `Edit ${d.name}` },
+    thumb,
+    el('div', { class: 'row-main' },
+      el('div', { class: 'row-title' }, el('span', { class: 'name' }, d.name),
+        isBest ? el('span', { class: 'badge' }, 'Best value') : null),
+      el('div', { class: 'row-sub' }, sub + (details ? ` · ${details}` : '')),
+      prices.length ? el('div', { class: 'row-prices' }, ...prices) : null),
+    el('span', { class: 'rating-badge', 'aria-label': `Rating ${d.rating} of 10` }, String(d.rating)));
 
-  card.addEventListener('click', () => openDrinkDialog(d.id));
-  card.addEventListener('keydown', (e) => {
-    if (e.target === card && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); openDrinkDialog(d.id); }
+  const del = el('button', { type: 'button', class: 'swipe-delete', tabindex: '-1' }, 'Delete');
+  const li = el('li', { class: isBest ? 'best' : null }, del, row);
+  del.addEventListener('click', async () => {
+    if (confirm(`Delete “${d.name}”? This cannot be undone.`)) await deleteDrinkById(d.id);
+    else closeSwipe(li);
   });
-  return card;
+  row.addEventListener('click', () => {
+    if (swipeJustEnded) return;
+    if (li.classList.contains('open')) { closeSwipe(li); return; }
+    openDrinkDialog(d.id);
+  });
+  row.addEventListener('keydown', (e) => {
+    if (e.target === row && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); openDrinkDialog(d.id); }
+  });
+  attachSwipe(li, row);
+  return li;
 }
 
 function showImage(d) {
@@ -570,7 +651,9 @@ function openDrinkDialog(id) {
   state.editingId = d ? d.id : null;
   $('#drinkForm').reset();
   showErrors({});
-  $('#drinkTitle').textContent = d ? 'Edit drink' : 'Add drink';
+  $('#drinkTitle').textContent = d ? 'Edit Drink' : 'New Drink';
+  state.categoryTouched = Boolean(d); // AI may only pick the category for new drinks
+  resetAiUi();
   fillCategorySelect($('#fCategory'), d ? d.tabId : (state.tab !== ALL ? state.tab : state.tabs[0].id));
   const str = (v) => (v === null || v === undefined ? '' : String(v));
   $('#fName').value = d ? d.name : '';
@@ -580,11 +663,14 @@ function openDrinkDialog(id) {
   $('#fVolume').value = d ? str(d.volume) : '';
   $('#fUnit').value = d ? d.volumeUnit : 'ml';
   $('#fAbv').value = d ? str(d.abv) : '';
+  $('#fCountry').value = d ? str(d.country) : '';
+  $('#fRegion').value = d ? str(d.region) : '';
   setRating(d ? d.rating : 0);
   state.formPhoto = d ? d.photo || null : null;
   state.formThumb = d ? d.thumb || null : null;
   renderPhotoPreview();
   $('#deleteDrinkBtn').hidden = !d;
+  $('#deleteDrinkGroup').hidden = !d;
   updateCalc();
   $('#drinkDialog').showModal();
 }
@@ -611,6 +697,8 @@ function readForm() {
     volume: $('#fVolume').value,
     volumeUnit: $('#fUnit').value,
     abv: $('#fAbv').value,
+    country: $('#fCountry').value,
+    region: $('#fRegion').value,
   };
 }
 
@@ -663,21 +751,26 @@ async function saveDrink(e) {
   $('#drinkDialog').close();
   renderAll();
   queueSync({ drinkIds: [drink.id] });
+  geocodeDrink(drink.id); // in the background; the map falls back to the country position
 }
 
 async function deleteDrink() {
   const d = state.drinks.find((x) => x.id === state.editingId);
   if (!d || !confirm(`Delete “${d.name}”? This cannot be undone.`)) return;
+  if (await deleteDrinkById(d.id)) $('#drinkDialog').close();
+}
+
+async function deleteDrinkById(id) {
   try {
-    await deleteKey('drinks', d.id);
+    await deleteKey('drinks', id);
   } catch (err) {
     alert('Could not delete: ' + err.message);
-    return;
+    return false;
   }
-  state.drinks = state.drinks.filter((x) => x.id !== d.id);
-  $('#drinkDialog').close();
+  state.drinks = state.drinks.filter((x) => x.id !== id);
   renderAll();
-  queueSync({ drinkIds: [d.id] });
+  queueSync({ drinkIds: [id] });
+  return true;
 }
 
 async function onPhotoChosen(input) {
@@ -715,6 +808,7 @@ function renderPhotoPreview() {
     box.replaceChildren(el('span', {}, 'No photo'));
   }
   $('#photoRemove').hidden = !state.formThumb;
+  $('#identifyBtn').hidden = !state.formPhoto;
 }
 
 /* ---------- Tabs management ---------- */
@@ -730,11 +824,11 @@ function renderTabsDialog() {
   const counts = {};
   state.drinks.forEach((d) => { counts[d.tabId] = (counts[d.tabId] || 0) + 1; });
   $('#tabList').replaceChildren(...state.tabs.map((t) => {
-    const input = el('input', { type: 'text', maxlength: '30', value: t.name, 'aria-label': `Rename ${t.name}` });
+    const input = el('input', { type: 'text', maxlength: '30', value: t.name, class: 'left', 'aria-label': `Rename ${t.name}` });
     input.addEventListener('change', () => renameTab(t.id, input));
-    const del = el('button', { type: 'button', class: 'btn ghost danger', 'aria-label': `Delete ${t.name}` }, 'Delete');
+    const del = el('button', { type: 'button', class: 'text-btn del', 'aria-label': `Delete ${t.name}` }, 'Delete');
     del.addEventListener('click', () => openDeleteTab(t.id));
-    return el('li', {}, input, el('span', { class: 'count' }, `${counts[t.id] || 0}`), del);
+    return el('li', {}, el('div', { class: 'frow' }, input, el('span', { class: 'count' }, `${counts[t.id] || 0}`), del));
   }));
 }
 
@@ -772,15 +866,15 @@ async function addTab(e) {
 
 function openDeleteTab(id) {
   if (state.tabs.length <= 1) {
-    $('#tabError').textContent = 'You need at least one tab.';
+    $('#tabError').textContent = 'You need at least one category.';
     return;
   }
   const tab = state.tabs.find((t) => t.id === id);
   const count = state.drinks.filter((d) => d.tabId === id).length;
   state.deletingTabId = id;
   $('#delTabText').textContent = count
-    ? `“${tab.name}” contains ${count} drink${count === 1 ? '' : 's'}. They will be moved to another tab, not deleted.`
-    : `Delete the empty tab “${tab.name}”?`;
+    ? `“${tab.name}” contains ${count} drink${count === 1 ? '' : 's'}. They will be moved to another category, not deleted.`
+    : `Delete the empty category “${tab.name}”?`;
   const others = state.tabs.filter((t) => t.id !== id);
   fillCategorySelect($('#delTabTarget'), fallbackTabId(others), id);
   $('#delTabMove').hidden = count === 0;
@@ -816,10 +910,15 @@ async function confirmDeleteTab() {
 /* ---------- Settings, export, import ---------- */
 
 function openSettings() {
+  showView('settings');
+}
+
+/** Fill the settings page with the current values. */
+function fillSettings() {
   $('#currency').value = state.settings.currency;
-  $('#ghMsg').textContent = '';
+  $('#aiKey').value = ai.key;
+  $('#aiWebSearch').checked = ai.webSearch;
   fillSyncForm();
-  $('#settingsDialog').showModal();
 }
 
 async function saveCurrency() {
@@ -865,7 +964,6 @@ async function importData(file) {
     alert('Import failed, nothing was changed: ' + err.message);
     return;
   }
-  $('#settingsDialog').close();
   alert('Import complete.');
   if (syncEnabled()) uploadEverything({ mirror: true }); // make GitHub match the imported data
 }
@@ -978,7 +1076,8 @@ async function syncDrink(id) {
 /** Drink as stored on GitHub (photo lives in its own file). */
 function drinkToRemote(d) {
   const out = {};
-  ['id', 'name', 'tabId', 'brand', 'notes', 'rating', 'price', 'volume', 'volumeUnit', 'abv', 'createdAt', 'updatedAt']
+  ['id', 'name', 'tabId', 'brand', 'notes', 'rating', 'price', 'volume', 'volumeUnit', 'abv',
+    'country', 'region', 'lat', 'lng', 'geoQuery', 'createdAt', 'updatedAt']
     .forEach((k) => { out[k] = d[k] === undefined ? null : d[k]; });
   out.hasPhoto = Boolean(d.photo);
   return out;
@@ -1226,9 +1325,695 @@ function bindSyncEvents() {
   window.addEventListener('online', runSync);
 }
 
+/* =====================================================================
+   Views (bottom tab bar) and collapsing large titles
+   ===================================================================== */
+
+const VIEWS = ['drinks', 'map', 'settings'];
+
+function viewFromHash() {
+  const v = location.hash.replace('#', '');
+  return VIEWS.includes(v) ? v : 'drinks';
+}
+
+function showView(name) {
+  if (!VIEWS.includes(name)) name = 'drinks';
+  const changed = state.view !== name;
+  state.view = name;
+  document.querySelectorAll('.view').forEach((v) => { v.hidden = v.dataset.view !== name; });
+  document.querySelectorAll('[data-go]').forEach((b) => {
+    if (b.dataset.go === name) b.setAttribute('aria-current', 'page');
+    else b.removeAttribute('aria-current');
+  });
+  if (location.hash !== '#' + name) history.replaceState(null, '', '#' + name);
+  if (changed) window.scrollTo(0, 0);
+  if (name === 'settings') fillSettings();
+  if (name === 'map') openMapView();
+}
+
+/** Show the small navbar title once the large title scrolls away. */
+function bindLargeTitles() {
+  if (!('IntersectionObserver' in window)) return;
+  document.querySelectorAll('.view').forEach((view) => {
+    const title = view.querySelector('.large-title');
+    const bar = view.querySelector('.navbar');
+    new IntersectionObserver(([entry]) => {
+      bar.classList.toggle('collapsed', !entry.isIntersecting && !view.hidden);
+    }, { rootMargin: '-50px 0px 0px 0px' }).observe(title);
+  });
+}
+
+/* =====================================================================
+   Swipe left on a list row to reveal "Delete"
+   ===================================================================== */
+
+const SWIPE_WIDTH = 88;
+let openSwipeRow = null;
+let swipeJustEnded = false;
+
+function closeSwipe(li) {
+  li.classList.remove('open');
+  li.querySelector('.drink-row').style.transform = '';
+  if (openSwipeRow === li) openSwipeRow = null;
+}
+
+function attachSwipe(li, row) {
+  let startX = 0;
+  let startY = 0;
+  let dx = 0;
+  let tracking = false;
+  let swiping = false;
+
+  row.addEventListener('pointerdown', (e) => {
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
+    startX = e.clientX;
+    startY = e.clientY;
+    dx = 0;
+    tracking = true;
+    swiping = false;
+  });
+  row.addEventListener('pointermove', (e) => {
+    if (!tracking) return;
+    const mx = e.clientX - startX;
+    const my = e.clientY - startY;
+    if (!swiping) {
+      if (Math.abs(my) > 10 && Math.abs(my) > Math.abs(mx)) { tracking = false; return; } // vertical scroll
+      if (Math.abs(mx) < 10) return;
+      swiping = true;
+      li.classList.add('swiping');
+      row.setPointerCapture(e.pointerId);
+      if (openSwipeRow && openSwipeRow !== li) closeSwipe(openSwipeRow);
+      row.style.transition = 'none';
+    }
+    const base = li.classList.contains('open') ? -SWIPE_WIDTH : 0;
+    dx = Math.max(-SWIPE_WIDTH * 1.4, Math.min(0, base + mx));
+    row.style.transform = `translateX(${dx}px)`;
+  });
+  const end = () => {
+    if (!tracking) return;
+    tracking = false;
+    if (!swiping) return;
+    row.style.transition = '';
+    li.classList.remove('swiping');
+    const open = dx < -SWIPE_WIDTH / 2;
+    li.classList.toggle('open', open);
+    row.style.transform = open ? `translateX(${-SWIPE_WIDTH}px)` : '';
+    openSwipeRow = open ? li : null;
+    // The click that follows a swipe must not open the drink.
+    swipeJustEnded = true;
+    setTimeout(() => { swipeJustEnded = false; }, 50);
+  };
+  row.addEventListener('pointerup', end);
+  row.addEventListener('pointercancel', end);
+}
+
+/* =====================================================================
+   AI: identify a drink from its photo (Anthropic Messages API)
+   ===================================================================== */
+
+const ai = { key: '', webSearch: true };
+let aiBusy = false;
+
+async function loadAiConfig() {
+  const meta = await getAll('meta');
+  const cfg = meta.find((m) => m.key === 'ai');
+  if (cfg) {
+    ai.key = cfg.apiKey || '';
+    ai.webSearch = cfg.webSearch !== false;
+  }
+}
+
+async function saveAiConfig() {
+  ai.key = $('#aiKey').value.trim();
+  ai.webSearch = $('#aiWebSearch').checked;
+  try { await putAll('meta', [{ key: 'ai', apiKey: ai.key, webSearch: ai.webSearch }]); } catch (e) { alert('Could not save: ' + e.message); }
+}
+
+const AI_SYSTEM = `You read labels of alcoholic drinks (bottles, cans, glasses with labels) from photos.
+Rules:
+- Report only what you can clearly read on the label, or what a web search result explicitly states for this exact product.
+- Never guess, estimate or infer. If a value is unreadable, ambiguous, or you are not sure, use null.
+- Do not use typical values for a style (e.g. "beers are usually 5%"). Unknown means null.
+- Answer with one JSON object only, no other text.`;
+
+function aiPrompt(categories, webSearch) {
+  return `Identify the drink in this photo. Return exactly this JSON object:
+{
+  "name": string|null,          // product name as printed (without the producer if it is separate)
+  "brand": string|null,         // producer, brewery, winery or distillery
+  "category": string|null,      // exactly one of: ${categories.map((c) => JSON.stringify(c)).join(', ')}; null if none fits clearly
+  "abv": number|null,           // alcohol % by volume, e.g. 13.5
+  "volume_ml": number|null,     // bottle/can size in milliliters, e.g. 750
+  "country": string|null,       // country of origin, English name (e.g. "Germany", "Scotland")
+  "region": string|null,        // wine region, city or place of production, if stated
+  "description": string|null,   // 1-2 neutral sentences based only on the label or sources
+  "from_web": string[]          // names of the fields you took from web search instead of the label
+}
+${webSearch
+    ? 'If name and producer are clearly legible, you may use web search to fill missing abv, volume_ml, country or region for this exact product. Do not search if you cannot identify the product. Use only values a source states explicitly.'
+    : 'Do not use any outside knowledge for numbers; only what is printed on the label.'}`;
+}
+
+/** Pull the JSON object out of the model's text (handles ```json fences). */
+function extractJson(text) {
+  if (typeof text !== 'string') return null;
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const candidate = fenced ? fenced[1] : text;
+  const start = candidate.indexOf('{');
+  const end = candidate.lastIndexOf('}');
+  if (start < 0 || end <= start) return null;
+  try {
+    const obj = JSON.parse(candidate.slice(start, end + 1));
+    return obj && typeof obj === 'object' && !Array.isArray(obj) ? obj : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+/** Validate the model's answer. Anything doubtful becomes null. */
+function sanitizeAiResult(obj, categories) {
+  const text = (v, max) => {
+    if (typeof v !== 'string') return null;
+    const s = v.trim();
+    if (!s || /^(null|none|unknown|n\/a|not visible|unreadable|-)$/i.test(s)) return null;
+    return s.slice(0, max);
+  };
+  const num = (v) => {
+    const n = typeof v === 'number' ? v : parseNumber(typeof v === 'string' ? v.replace(/\s*(%|ml)$/i, '') : null);
+    return typeof n === 'number' && Number.isFinite(n) ? n : null;
+  };
+  const o = obj && typeof obj === 'object' ? obj : {};
+  const abv = num(o.abv);
+  const vol = num(o.volume_ml);
+  const cat = text(o.category, 30);
+  const match = cat ? categories.find((c) => c.toLowerCase() === cat.toLowerCase()) : null;
+  return {
+    name: text(o.name, 120),
+    brand: text(o.brand, 120),
+    category: match || null,
+    abv: abv !== null && abv >= 0 && abv <= 100 ? abv : null,
+    volumeMl: vol !== null && vol > 0 && vol <= 30000 ? vol : null,
+    country: text(o.country, 80),
+    region: text(o.region, 80),
+    description: text(o.description, 500),
+    fromWeb: Array.isArray(o.from_web) ? o.from_web.filter((f) => typeof f === 'string') : [],
+  };
+}
+
+/** Call the Messages API with the photo. Returns the final response JSON. */
+async function callClaude(imageBase64, categories, webSearch) {
+  const messages = [{
+    role: 'user',
+    content: [
+      { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: imageBase64 } },
+      { type: 'text', text: aiPrompt(categories, webSearch) },
+    ],
+  }];
+  const body = {
+    model: AI_MODEL,
+    max_tokens: 16000,
+    system: AI_SYSTEM,
+    output_config: { effort: 'medium' },
+    fallbacks: 'default', // if the model declines, the API retries on a fallback model
+    messages,
+  };
+  if (webSearch) body.tools = [{ type: 'web_search_20260209', name: 'web_search', max_uses: 3 }];
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), AI_TIMEOUT_MS);
+  try {
+    let collected = [];
+    for (let turn = 0; turn < 4; turn++) {
+      let res;
+      try {
+        res = await fetch('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          signal: controller.signal,
+          headers: {
+            'content-type': 'application/json',
+            'x-api-key': ai.key,
+            'anthropic-version': '2026-10-21',
+            'anthropic-beta': 'server-side-fallback-2026-07-01',
+            'anthropic-dangerous-direct-browser-access': 'true',
+          },
+          body: JSON.stringify(body),
+        });
+      } catch (e) {
+        if (e.name === 'AbortError') throw new Error('The request timed out. Please try again.');
+        throw new Error('No connection to the Anthropic API.');
+      }
+      let data = null;
+      try { data = await res.json(); } catch (e) { /* not JSON */ }
+      if (!res.ok) {
+        const msg = (data && data.error && data.error.message) || '';
+        if (res.status === 401) throw new Error('The API key was rejected. Check it in Settings.');
+        if (res.status === 403) throw new Error('This API key is not allowed to do this. ' + msg);
+        if (res.status === 429) throw new Error('Rate limit or credit limit reached. Try again later.');
+        if (res.status >= 500) throw new Error('The Anthropic API is busy right now. Try again in a moment.');
+        throw new Error(`API error ${res.status}: ${msg}`);
+      }
+      collected = collected.concat(data.content || []);
+      if (data.stop_reason === 'pause_turn') {
+        // Long server-side tool use: continue the same turn.
+        messages.push({ role: 'assistant', content: data.content });
+        continue;
+      }
+      if (data.stop_reason === 'refusal') throw new Error('The model declined to analyse this photo.');
+      if (data.stop_reason === 'max_tokens') throw new Error('The answer was cut off. Please try again.');
+      return { content: collected, final: data.content || [] };
+    }
+    throw new Error('The model did not finish. Please try again.');
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Sources the model cited (or searched) for display. */
+function aiSources(content) {
+  const seen = new Map();
+  content.forEach((b) => {
+    if (b.type === 'text' && Array.isArray(b.citations)) {
+      b.citations.forEach((c) => { if (c.url && !seen.has(c.url)) seen.set(c.url, { url: c.url, title: c.title || c.url, cited: true }); });
+    }
+  });
+  if (seen.size === 0) {
+    content.forEach((b) => {
+      if (b.type === 'web_search_tool_result' && Array.isArray(b.content)) {
+        b.content.slice(0, 3).forEach((r) => { if (r.url && !seen.has(r.url)) seen.set(r.url, { url: r.url, title: r.title || r.url, cited: false }); });
+      }
+    });
+  }
+  return [...seen.values()].filter((s) => /^https?:\/\//.test(s.url)).slice(0, 5);
+}
+
+function resetAiUi() {
+  $('#aiMsg').hidden = true;
+  $('#aiMsg').textContent = '';
+  $('#aiSources').hidden = true;
+  $('#aiSources').replaceChildren();
+  document.querySelectorAll('#drinkForm .ai-filled').forEach((r) => r.classList.remove('ai-filled'));
+}
+
+function showAiMsg(text, isError) {
+  const m = $('#aiMsg');
+  m.textContent = text;
+  m.classList.toggle('error', Boolean(isError));
+  m.hidden = false;
+}
+
+function setAiBusy(busy) {
+  aiBusy = busy;
+  const b = $('#identifyBtn');
+  b.disabled = busy;
+  b.classList.toggle('busy', busy);
+  b.textContent = busy ? 'Identifying…' : '✨ Identify drink';
+}
+
+async function identifyDrink() {
+  if (aiBusy || !state.formPhoto) return;
+  resetAiUi();
+  if (!ai.key) {
+    showAiMsg('Add your Anthropic API key in Settings to use this. You can still fill in the form manually.', true);
+    return;
+  }
+  const editingId = state.editingId;
+  const categories = state.tabs.map((t) => t.name);
+  setAiBusy(true);
+  try {
+    const b64 = bytesToBase64(new Uint8Array(await state.formPhoto.arrayBuffer()));
+    const res = await callClaude(b64, categories, ai.webSearch);
+    // Ignore the answer if the sheet was closed or switched to another drink meanwhile.
+    if (!$('#drinkDialog').open || state.editingId !== editingId) return;
+    const text = res.final.filter((b) => b.type === 'text').map((b) => b.text).join('');
+    const parsed = extractJson(text);
+    if (!parsed) { showAiMsg('The answer could not be read. Please fill in the form manually or try again.', true); return; }
+    const r = sanitizeAiResult(parsed, categories);
+    const filled = applyAiSuggestions(r);
+    const sources = aiSources(res.content);
+    renderAiSources(sources);
+    if (filled.length === 0) {
+      showAiMsg('Nothing new could be read reliably from this photo. Fields you already filled were kept.', false);
+    } else {
+      showAiMsg(`Filled: ${filled.join(', ')}. Please check the highlighted fields before saving.` +
+        (r.fromWeb.length && sources.length ? ' Some values come from the web sources below.' : ''), false);
+    }
+  } catch (err) {
+    showAiMsg(err.message + ' The form still works manually.', true);
+  } finally {
+    setAiBusy(false);
+  }
+}
+
+/** Fill only empty fields. Returns labels of the fields that were filled. */
+function applyAiSuggestions(r) {
+  const filled = [];
+  const fill = (sel, value, label) => {
+    const input = $(sel);
+    if (value === null || value === undefined || input.value.trim() !== '') return;
+    input.value = String(value);
+    input.closest('.frow').classList.add('ai-filled');
+    filled.push(label);
+  };
+  fill('#fName', r.name, 'name');
+  fill('#fBrand', r.brand, 'producer');
+  if (r.category && !state.categoryTouched) {
+    const tab = state.tabs.find((t) => t.name === r.category);
+    if (tab && $('#fCategory').value !== tab.id) {
+      $('#fCategory').value = tab.id;
+      $('#fCategory').closest('.frow').classList.add('ai-filled');
+      filled.push('category');
+    }
+  }
+  if (r.volumeMl !== null && $('#fVolume').value.trim() === '') {
+    $('#fUnit').value = 'ml';
+    fill('#fVolume', r.volumeMl, 'volume');
+  }
+  fill('#fAbv', r.abv, 'ABV');
+  fill('#fCountry', r.country, 'country');
+  fill('#fRegion', r.region, 'region');
+  if (r.description && $('#fNotes').value.trim() === '') {
+    $('#fNotes').value = r.description;
+    filled.push('notes');
+  }
+  updateCalc();
+  return filled;
+}
+
+function renderAiSources(sources) {
+  const box = $('#aiSources');
+  if (!sources.length) { box.hidden = true; return; }
+  const label = sources[0].cited ? 'Sources:' : 'Searched:';
+  box.replaceChildren(el('span', {}, label),
+    ...sources.map((s) => el('a', { href: s.url, target: '_blank', rel: 'noopener noreferrer' }, s.title)));
+  box.hidden = false;
+}
+
+/* =====================================================================
+   Countries (offline lookup: name, lat, lng, aliases incl. German names)
+   ===================================================================== */
+
+const COUNTRIES = [
+  ['Argentina', -34, -64, 'argentinien'], ['Armenia', 40.1, 45, 'armenien'],
+  ['Australia', -25, 134, 'australien'], ['Austria', 47.5, 14.5, 'österreich,oesterreich'],
+  ['Azerbaijan', 40.3, 47.7, 'aserbaidschan'], ['Barbados', 13.2, -59.5, ''],
+  ['Belarus', 53.7, 28, 'weißrussland'], ['Belgium', 50.6, 4.6, 'belgien,belgique,belgië'],
+  ['Belize', 17.2, -88.7, ''], ['Bolivia', -16.5, -64.7, 'bolivien'],
+  ['Bosnia and Herzegovina', 44, 17.8, 'bosnien,bosnien und herzegowina'], ['Brazil', -10, -52, 'brasilien,brasil'],
+  ['Bulgaria', 42.7, 25.3, 'bulgarien'], ['Cambodia', 12.6, 104.9, 'kambodscha'],
+  ['Canada', 56, -106, 'kanada'], ['Chile', -33, -71, ''],
+  ['China', 35, 103, ''], ['Colombia', 4, -73, 'kolumbien'],
+  ['Costa Rica', 9.9, -84.1, ''], ['Croatia', 45.1, 15.2, 'kroatien,hrvatska'],
+  ['Cuba', 21.5, -79.5, 'kuba'], ['Cyprus', 35, 33, 'zypern'],
+  ['Czech Republic', 49.8, 15.5, 'czechia,tschechien,tschechische republik'], ['Denmark', 56, 10, 'dänemark,daenemark,danmark'],
+  ['Dominican Republic', 18.9, -70.4, 'dominikanische republik'], ['Ecuador', -1.5, -78.2, ''],
+  ['Egypt', 26.8, 30.8, 'ägypten'], ['El Salvador', 13.8, -88.9, ''],
+  ['England', 52.5, -1.5, ''], ['Estonia', 58.6, 25, 'estland'],
+  ['Ethiopia', 9.1, 40.5, 'äthiopien'], ['Fiji', -17.7, 178, 'fidschi'],
+  ['Finland', 62, 26, 'finnland,suomi'], ['France', 46.6, 2.4, 'frankreich'],
+  ['Georgia', 42.2, 43.5, 'georgien'], ['Germany', 51.2, 10.4, 'deutschland'],
+  ['Ghana', 7.9, -1, ''], ['Greece', 39.1, 22, 'griechenland'],
+  ['Guatemala', 15.7, -90.2, ''], ['Guyana', 4.9, -58.9, ''],
+  ['Haiti', 19, -72.4, ''], ['Honduras', 14.8, -86.6, ''],
+  ['Hungary', 47.2, 19.5, 'ungarn,magyarország'], ['Iceland', 64.9, -18.6, 'island'],
+  ['India', 22, 79, 'indien'], ['Indonesia', -2.5, 118, 'indonesien'],
+  ['Ireland', 53.2, -8, 'irland,eire,republic of ireland'], ['Israel', 31.4, 35, ''],
+  ['Italy', 42.8, 12.6, 'italien,italia'], ['Jamaica', 18.1, -77.3, 'jamaika'],
+  ['Japan', 36.2, 138.3, ''], ['Kazakhstan', 48, 67, 'kasachstan'],
+  ['Kenya', 0.2, 37.9, 'kenia'], ['Latvia', 56.9, 24.6, 'lettland'],
+  ['Lebanon', 33.9, 35.9, 'libanon'], ['Lithuania', 55.2, 23.9, 'litauen'],
+  ['Luxembourg', 49.8, 6.1, 'luxemburg'], ['Malta', 35.9, 14.4, ''],
+  ['Martinique', 14.6, -61, ''], ['Mauritius', -20.3, 57.6, ''],
+  ['Mexico', 23.6, -102.5, 'mexiko,méxico'], ['Moldova', 47.4, 28.4, 'moldawien,moldau'],
+  ['Montenegro', 42.7, 19.4, ''], ['Morocco', 31.8, -7.1, 'marokko'],
+  ['Netherlands', 52.2, 5.3, 'niederlande,holland,nederland,the netherlands'], ['New Zealand', -41.5, 172.8, 'neuseeland'],
+  ['Nicaragua', 12.9, -85.2, ''], ['Nigeria', 9.1, 8.7, ''],
+  ['North Macedonia', 41.6, 21.7, 'nordmazedonien,macedonia'], ['Northern Ireland', 54.6, -6.7, 'nordirland'],
+  ['Norway', 61, 8.5, 'norwegen,norge'], ['Panama', 8.5, -80.8, ''],
+  ['Paraguay', -23.4, -58.4, ''], ['Peru', -9.2, -75, ''],
+  ['Philippines', 12.9, 121.8, 'philippinen'], ['Poland', 52, 19.4, 'polen,polska'],
+  ['Portugal', 39.6, -8, ''], ['Puerto Rico', 18.2, -66.5, ''],
+  ['Romania', 45.9, 25, 'rumänien,rumaenien'], ['Russia', 56, 40, 'russland,russian federation'],
+  ['Scotland', 56.8, -4.2, 'schottland'], ['Serbia', 44, 20.9, 'serbien'],
+  ['Singapore', 1.35, 103.8, 'singapur'], ['Slovakia', 48.7, 19.7, 'slowakei'],
+  ['Slovenia', 46.1, 14.9, 'slowenien'], ['South Africa', -30.6, 22.9, 'südafrika,suedafrika'],
+  ['South Korea', 36.5, 127.9, 'korea,südkorea,republic of korea'], ['Spain', 40.2, -3.7, 'spanien,españa,espana'],
+  ['Sri Lanka', 7.9, 80.8, ''], ['Sweden', 62, 15, 'schweden,sverige'],
+  ['Switzerland', 46.8, 8.2, 'schweiz,suisse,svizzera'], ['Taiwan', 23.7, 121, ''],
+  ['Tanzania', -6.4, 34.9, 'tansania'], ['Thailand', 15.9, 100.9, ''],
+  ['Trinidad and Tobago', 10.7, -61.2, 'trinidad'], ['Tunisia', 34, 9, 'tunesien'],
+  ['Turkey', 39, 35.2, 'türkei,tuerkei,türkiye'], ['Ukraine', 49, 31.4, ''],
+  ['United Kingdom', 54, -2.5, 'uk,great britain,britain,großbritannien,grossbritannien,vereinigtes königreich'],
+  ['United States', 39.8, -98.6, 'usa,us,u.s.,u.s.a.,united states of america,america,vereinigte staaten'],
+  ['Uruguay', -32.5, -55.8, ''], ['Venezuela', 6.4, -66.6, ''],
+  ['Vietnam', 14.1, 108.3, 'viet nam'], ['Wales', 52.3, -3.7, ''],
+];
+
+const COUNTRY_INDEX = new Map();
+COUNTRIES.forEach(([name, lat, lng, aliases]) => {
+  const entry = { name, lat, lng };
+  [name, ...aliases.split(',')].filter(Boolean).forEach((a) => COUNTRY_INDEX.set(a.toLowerCase(), entry));
+});
+
+/** Known country for a typed name (English or German), or null. */
+function findCountry(name) {
+  if (typeof name !== 'string') return null;
+  return COUNTRY_INDEX.get(name.trim().toLowerCase()) || null;
+}
+
+/* =====================================================================
+   Geocoding (Nominatim) – only for regions/cities and unknown countries.
+   The result is cached in the drink record; on failure the map uses
+   the country position from the table above.
+   ===================================================================== */
+
+/** The place to look up for a drink, or null if the country table is enough. */
+function geoQueryFor(d) {
+  if (d.region) return d.country ? `${d.region}, ${d.country}` : d.region;
+  if (d.country && !findCountry(d.country)) return d.country;
+  return null;
+}
+
+/** Map position of a drink: cached geocode for its current place, else country table. */
+function drinkPosition(d) {
+  const q = geoQueryFor(d);
+  if (q && d.geoQuery === q && validLatLng(d.lat, d.lng)) {
+    return { lat: d.lat, lng: d.lng, key: 'g:' + q.toLowerCase(), label: q, region: Boolean(d.region) };
+  }
+  const c = findCountry(d.country);
+  if (c) return { lat: c.lat, lng: c.lng, key: 'c:' + c.name, label: c.name, region: false };
+  return null;
+}
+
+/** Group drinks by map position. Returns { groups, without }. */
+function groupForMap(drinks) {
+  const groups = new Map();
+  let without = 0;
+  drinks.forEach((d) => {
+    const p = drinkPosition(d);
+    if (!p) { without++; return; }
+    if (!groups.has(p.key)) groups.set(p.key, { key: p.key, label: p.label, lat: p.lat, lng: p.lng, region: p.region, drinks: [] });
+    groups.get(p.key).drinks.push(d);
+  });
+  return { groups: [...groups.values()], without };
+}
+
+/** Number of distinct countries (known names count once, whatever language). */
+function countCountries(drinks) {
+  const set = new Set();
+  drinks.forEach((d) => {
+    if (!d.country) return;
+    const c = findCountry(d.country);
+    set.add(c ? c.name : d.country.trim().toLowerCase());
+  });
+  return set.size;
+}
+
+let lastGeocodeAt = 0;
+
+async function nominatim(query) {
+  // Nominatim usage policy: at most one request per second.
+  const wait = lastGeocodeAt + 1100 - Date.now();
+  if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+  lastGeocodeAt = Date.now();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 10000);
+  try {
+    const res = await fetch('https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&q=' + encodeURIComponent(query),
+      { signal: controller.signal, headers: { 'Accept-Language': 'en' } });
+    if (!res.ok) return null;
+    const list = await res.json();
+    const lat = Number(list[0] && list[0].lat);
+    const lng = Number(list[0] && list[0].lon);
+    return validLatLng(lat, lng) ? { lat, lng } : null;
+  } catch (e) {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Look up the drink's region (if needed) and cache the position in the record. */
+async function geocodeDrink(id) {
+  const d = state.drinks.find((x) => x.id === id);
+  if (!d) return;
+  const q = geoQueryFor(d);
+  if (!q) {
+    if (d.lat === null && d.geoQuery === null) return;
+    return storeGeo(id, null, null, null);
+  }
+  if (q === d.geoQuery && validLatLng(d.lat, d.lng)) return; // already up to date
+  const pos = await nominatim(q);
+  if (pos) await storeGeo(id, pos.lat, pos.lng, q);
+}
+
+async function storeGeo(id, lat, lng, geoQuery) {
+  const d = state.drinks.find((x) => x.id === id);
+  if (!d) return;
+  const updated = Object.assign({}, d, { lat, lng, geoQuery });
+  try { await putAll('drinks', [updated]); } catch (e) { return; }
+  state.drinks = state.drinks.map((x) => (x.id === id ? updated : x));
+  if (state.view === 'map') renderMap();
+  queueSync({ drinkIds: [id] });
+}
+
+let geocodingAll = false;
+
+/** When the map opens, look up regions that were never geocoded (e.g. after an import). */
+async function geocodeMissing() {
+  if (geocodingAll || !navigator.onLine) return;
+  geocodingAll = true;
+  try {
+    const todo = state.drinks.filter((d) => {
+      const q = geoQueryFor(d);
+      return q && !(q === d.geoQuery && validLatLng(d.lat, d.lng));
+    });
+    for (const d of todo.slice(0, 20)) await geocodeDrink(d.id);
+  } finally {
+    geocodingAll = false;
+  }
+}
+
+/* =====================================================================
+   Map (Leaflet + OpenStreetMap, loaded from a CDN on first use)
+   ===================================================================== */
+
+let map = null;
+let mapLayer = null;
+let leafletPromise = null;
+let mapNeedsFit = true;
+
+function loadLeaflet() {
+  if (window.L) return Promise.resolve(window.L);
+  if (!leafletPromise) {
+    leafletPromise = new Promise((resolve, reject) => {
+      const css = el('link', { rel: 'stylesheet', href: LEAFLET_URL + 'leaflet.css' });
+      const js = el('script', { src: LEAFLET_URL + 'leaflet.js' });
+      js.onload = () => resolve(window.L);
+      js.onerror = () => { leafletPromise = null; reject(new Error('Map library could not be loaded.')); };
+      document.head.append(css, js);
+    });
+  }
+  return leafletPromise;
+}
+
+async function openMapView() {
+  renderMapChips();
+  renderMapStats();
+  let L;
+  try {
+    L = await loadLeaflet();
+  } catch (e) {
+    $('#mapMsg').textContent = 'The map needs an internet connection. Your data is fine – try again when online.';
+    return;
+  }
+  if (!map) {
+    map = L.map('map', { worldCopyJump: true, zoomControl: true }).setView([30, 10], 2);
+    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 18,
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+    }).addTo(map);
+    mapLayer = L.layerGroup().addTo(map);
+  }
+  map.invalidateSize();
+  mapNeedsFit = true;
+  renderMap();
+  geocodeMissing();
+}
+
+function mapDrinks() {
+  return state.mapTab === ALL ? state.drinks : state.drinks.filter((d) => d.tabId === state.mapTab);
+}
+
+function renderMapChips() {
+  const make = (id, name) => {
+    const b = el('button', { type: 'button', class: 'pill', 'aria-pressed': String(state.mapTab === id) }, name);
+    b.addEventListener('click', () => { state.mapTab = id; mapNeedsFit = true; renderMapChips(); renderMap(); });
+    return b;
+  };
+  $('#mapChips').replaceChildren(make(ALL, 'All'), ...state.tabs.map((t) => make(t.id, t.name)));
+}
+
+function renderMapStats() {
+  const n = countCountries(state.drinks);
+  $('#mapStats').textContent = `${n} ${n === 1 ? 'country' : 'countries'} visited`;
+}
+
+function renderMap() {
+  renderMapStats();
+  if (!state.tabs.some((t) => t.id === state.mapTab)) state.mapTab = ALL;
+  const drinks = mapDrinks();
+  const { groups, without } = groupForMap(drinks);
+  $('#mapMsg').textContent = [
+    `${drinks.length - without} drink${drinks.length - without === 1 ? '' : 's'} on the map`,
+    without ? `${without} without origin (add a country to show them)` : '',
+  ].filter(Boolean).join(' · ');
+  if (!map || !window.L) return;
+  const L = window.L;
+  mapLayer.clearLayers();
+  groups.forEach((g) => {
+    const icon = L.divIcon({
+      className: '',
+      html: `<div class="map-pin${g.region ? ' region' : ''}">${g.drinks.length}</div>`,
+      iconSize: [34, 34],
+      iconAnchor: [17, 17],
+    });
+    L.marker([g.lat, g.lng], { icon, title: g.label, keyboard: true })
+      .on('click', () => showGroup(g))
+      .addTo(mapLayer);
+  });
+  if (mapNeedsFit) {
+    mapNeedsFit = false;
+    if (groups.length) map.fitBounds(groups.map((g) => [g.lat, g.lng]), { padding: [40, 40], maxZoom: 6 });
+    else map.setView([30, 10], 2);
+  }
+}
+
+/** Sheet listing the drinks of one map pin. */
+function showGroup(g) {
+  $('#groupTitle').textContent = g.label;
+  $('#groupList').replaceChildren(...g.drinks
+    .slice().sort((a, b) => b.rating - a.rating)
+    .map((d) => el('li', {}, el('button', { type: 'button', class: 'frow link-row', 'data-id': d.id },
+      el('span', { class: 'row-main' }, d.name, el('div', { class: 'row-sub' }, [tabName(d.tabId), d.brand].filter(Boolean).join(' · '))),
+      el('span', { class: 'rating-badge' }, String(d.rating)),
+      el('span', { class: 'chev', 'aria-hidden': 'true' })))));
+  $('#groupDialog').showModal();
+}
+
+/* =====================================================================
+   PWA: offline app shell (only over https or localhost)
+   ===================================================================== */
+
+function registerServiceWorker() {
+  if (!('serviceWorker' in navigator)) return;
+  if (location.protocol !== 'https:' && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1') return;
+  navigator.serviceWorker.register('sw.js').catch(() => { /* app works without it */ });
+}
+
 /* ---------- Boot ---------- */
 
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { parseNumber, roundMoney, toLiters, calcPrices, validateDrink, applyView, pickBestValue, validateTabName, parseBackup, fallbackTabId, gitBlobSha, bytesToBase64, drinkToRemote };
+  module.exports = { parseNumber, roundMoney, toLiters, calcPrices, validateDrink, applyView, pickBestValue, validateTabName, parseBackup, fallbackTabId, gitBlobSha, bytesToBase64, drinkToRemote,
+    sanitizeAiResult, extractJson, findCountry, drinkPosition, groupForMap, countCountries, geoQueryFor, AI_MODEL };
 }
 if (typeof document !== 'undefined') init();

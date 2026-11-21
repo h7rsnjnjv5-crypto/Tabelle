@@ -122,3 +122,74 @@ test('backup parsing keeps drinks whose tab is missing', () => {
 
   console.log(`\nAll ${passed} tests passed.`);
 })();
+
+test('AI answer: JSON is extracted from fences or surrounding text', () => {
+  assert.deepStrictEqual(app.extractJson('Here:\n```json\n{"name":"X"}\n```'), { name: 'X' });
+  assert.deepStrictEqual(app.extractJson('I found it. {"name": "Y", "abv": 5} Done.'), { name: 'Y', abv: 5 });
+  assert.strictEqual(app.extractJson('no json here'), null);
+  assert.strictEqual(app.extractJson('{"broken": '), null);
+  assert.strictEqual(app.extractJson(undefined), null);
+});
+
+test('AI answer: doubtful values become null, never invented', () => {
+  const cats = ['Wine', 'Beer', 'Spirits'];
+  const r = app.sanitizeAiResult({
+    name: '  Riesling Trocken ', brand: 'unknown', category: 'wine', abv: '12,5 %', volume_ml: 750,
+    country: 'Germany', region: null, description: 'N/A', from_web: ['abv', 3],
+  }, cats);
+  assert.strictEqual(r.name, 'Riesling Trocken');
+  assert.strictEqual(r.brand, null);
+  assert.strictEqual(r.category, 'Wine');          // matched to the user's category name
+  assert.strictEqual(r.abv, 12.5);
+  assert.strictEqual(r.volumeMl, 750);
+  assert.strictEqual(r.region, null);
+  assert.strictEqual(r.description, null);
+  assert.deepStrictEqual(r.fromWeb, ['abv']);
+  const bad = app.sanitizeAiResult({ abv: 140, volume_ml: -1, category: 'Cider', name: 42 }, cats);
+  assert.strictEqual(bad.abv, null);
+  assert.strictEqual(bad.volumeMl, null);
+  assert.strictEqual(bad.category, null);           // not one of the user's categories
+  assert.strictEqual(bad.name, null);
+  assert.deepStrictEqual(app.sanitizeAiResult(null, cats).name, null);
+  assert.ok(/^claude-/.test(app.AI_MODEL));
+});
+
+test('countries: English + German names, map grouping and counter', () => {
+  assert.strictEqual(app.findCountry('deutschland').name, 'Germany');
+  assert.strictEqual(app.findCountry(' Schottland ').name, 'Scotland');
+  assert.strictEqual(app.findCountry('USA').name, 'United States');
+  assert.strictEqual(app.findCountry('Atlantis'), null);
+  const drinks = [
+    { id: 1, country: 'Germany', region: null, lat: null, lng: null, geoQuery: null },
+    { id: 2, country: 'Deutschland', region: null, lat: null, lng: null, geoQuery: null },
+    { id: 3, country: 'France', region: 'Bordeaux', lat: 44.84, lng: -0.58, geoQuery: 'Bordeaux, France' },
+    { id: 4, country: 'France', region: 'Alsace', lat: null, lng: null, geoQuery: null }, // not geocoded: falls back to France
+    { id: 5, country: null, region: null },
+    { id: 6, country: 'France', region: 'Champagne', lat: 49, lng: 4, geoQuery: 'Reims, France' }, // stale cache: ignored
+  ];
+  const { groups, without } = app.groupForMap(drinks);
+  const byLabel = Object.fromEntries(groups.map((g) => [g.label, g.drinks.map((d) => d.id)]));
+  assert.deepStrictEqual(byLabel, { Germany: [1, 2], 'Bordeaux, France': [3], France: [4, 6] });
+  assert.strictEqual(without, 1);
+  assert.strictEqual(app.countCountries(drinks), 2);
+  assert.strictEqual(app.geoQueryFor({ country: 'Germany', region: null }), null);   // table is enough
+  assert.strictEqual(app.geoQueryFor({ country: 'Atlantis', region: null }), 'Atlantis');
+  assert.strictEqual(app.geoQueryFor({ country: 'Italy', region: 'Piemonte' }), 'Piemonte, Italy');
+});
+
+test('old backups (without origin fields) still import; new fields round-trip', () => {
+  const old = app.parseBackup({ tabs: [{ id: 't', name: 'Wine' }], drinks: [{ id: 'a', name: 'Old', tabId: 't', rating: 7 }] });
+  assert.strictEqual(old.drinks[0].country, null);
+  assert.strictEqual(old.drinks[0].lat, null);
+  const neu = app.parseBackup({ tabs: [{ id: 't', name: 'Wine' }], drinks: [{
+    id: 'b', name: 'New', tabId: 't', rating: 7, country: ' Italy ', region: 'Piemonte', lat: 44.7, lng: 8, geoQuery: 'Piemonte, Italy' }] });
+  assert.strictEqual(neu.drinks[0].country, 'Italy');
+  assert.strictEqual(neu.drinks[0].lat, 44.7);
+  assert.strictEqual(neu.drinks[0].geoQuery, 'Piemonte, Italy');
+  const junk = app.parseBackup({ tabs: [{ id: 't', name: 'Wine' }], drinks: [{ id: 'c', name: 'J', tabId: 't', rating: 7, lat: 'x', lng: 999 }] });
+  assert.strictEqual(junk.drinks[0].lat, null);
+  const remote = app.drinkToRemote(neu.drinks[0]);
+  assert.strictEqual(remote.region, 'Piemonte');
+  assert.strictEqual(remote.lng, 8);
+});
+

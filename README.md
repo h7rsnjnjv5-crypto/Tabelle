@@ -1,15 +1,43 @@
 # Drink Tracker
 
-Track and rate alcoholic drinks. Plain HTML/CSS/JS, no build step, no backend.
-All data (including photos) is stored locally in the browser's IndexedDB.
+Track, rate and map alcoholic drinks. Plain HTML/CSS/vanilla JS, no build step, no backend.
+All data (including photos) is stored locally in the browser's IndexedDB. iOS-style design,
+installable as an app (PWA), dark mode follows the system.
 
-## Use it
-- **Desktop:** open `index.html` in a browser, or serve the folder (`python3 -m http.server`).
-- **Phone:** host the folder anywhere static (e.g. GitHub Pages) and open it in the phone's browser.
-  "Take photo" opens the camera; "Choose image" opens the gallery.
+## Run it
 
-Data lives only in that browser on that device. Use **Settings → Export JSON** regularly as a backup;
-**Import JSON** restores a backup (it replaces the current data).
+Camera access, "Add to Home Screen" (PWA) and offline mode need **HTTPS or localhost**.
+
+**On your computer (testing):** serve the folder with any static server, then open http://localhost:8000
+```sh
+python3 -m http.server 8000      # or: npx serve .
+```
+(Opening `index.html` directly via `file://` works for basic use, but without the offline/PWA part.)
+
+**On your phone (recommended): GitHub Pages** – free HTTPS hosting.
+1. Repository → Settings → Pages → *Deploy from a branch* → pick the branch with these files, folder `/ (root)` → Save.
+2. After a minute open `https://<user>.github.io/<repo>/` in Safari (iPhone) or Chrome (Android).
+3. Share menu → **Add to Home Screen**. It now opens full-screen like an app and works offline
+   (the map and AI need a connection).
+
+Data lives in the browser of that device. Use **Settings → Export JSON** regularly as a backup;
+**Import JSON** restores it (replaces the current data). Backups from older versions still import.
+
+## Identify drinks with AI (optional)
+Take or choose a photo, then tap **Identify drink**. The photo is sent to the Anthropic API, which reads
+the label and returns name, producer, category, ABV, volume, country, region and a short description.
+- Values it cannot read are left empty – it is told never to guess, and the app re-checks every value.
+- With *Web search* on (Settings), it may look up missing ABV/origin for a clearly identified product; sources are shown.
+- Only **empty** fields are filled and highlighted; nothing is saved until you tap Save.
+- Needs your own API key (Settings → *API key*, from https://console.anthropic.com). It is stored only on this
+  device, never exported, and sent only to `api.anthropic.com`. Meant for personal use; usage is billed to your account.
+- The model is set by `AI_MODEL` at the top of `app.js`.
+
+## Map
+Each drink can have a country and an optional region/city. The **Map** tab shows pins grouped by country
+(blue) or region (orange) with a count; tap a pin to see its drinks. Country positions come from a built-in table
+(works offline, English and German names). Regions are looked up once via OpenStreetMap Nominatim when you save,
+and cached in the drink; if that fails, the pin falls back to the country.
 
 ## Save to GitHub (optional)
 Settings → **Save to GitHub** saves every new, edited or deleted entry automatically to a GitHub repository.
@@ -18,16 +46,15 @@ Settings → **Save to GitHub** saves every new, edited or deleted entry automat
 2. In the app enter the repository (`owner/name`), keep branch `data`, paste the token, tap **Save & connect**.
 
 Files on the `data` branch: `drinks/<id>.json`, `photos/<id>.jpg`, `config.json` (tabs + currency).
-Changes made offline are queued and uploaded later (status line under the title).
-On another device, connect with the same settings to load the data from GitHub.
+Changes made offline are queued and uploaded later (status next to the title).
 **If the repository is public, the data and photos are public too** — use a private repository for private data.
-The token is stored only on the device and is never included in exports.
 
 ## Files
-- `index.html` – markup and dialogs
-- `style.css` – styles (dark mode follows the system)
-- `app.js` – storage, calculations, UI
-- `test.js` – tests for the price math and validation: `node test.js`
+- `index.html` – markup, views and sheets
+- `style.css` – iOS-style styles (light + dark)
+- `app.js` – storage, calculations, UI, AI, map, sync
+- `sw.js`, `manifest.webmanifest`, `icons/` – PWA (offline app shell, home-screen icon)
+- `test.js` – tests for calculations, validation, AI-answer checking, countries/map grouping: `node test.js`
 
 ## Calculations
 - Price per liter = price ÷ volume in liters
