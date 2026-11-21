@@ -1,0 +1,20 @@
+{
+  "id": "mwqtvfvjiikf0d5i",
+  "name": "Absolut",
+  "tabId": "mwqrykni1gp954aa",
+  "brand": "14",
+  "notes": "",
+  "rating": 3,
+  "price": 14.99,
+  "volume": 700,
+  "volumeUnit": "ml",
+  "abv": 40,
+  "country": "Sweden",
+  "region": "Stockholm",
+  "lat": null,
+  "lng": null,
+  "geoQuery": null,
+  "createdAt": 1795290941215,
+  "updatedAt": 1795290941215,
+  "hasPhoto": false
+}
