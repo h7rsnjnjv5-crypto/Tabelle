@@ -106,6 +106,21 @@ test('backup parsing keeps drinks whose tab is missing', () => {
   assert.throws(() => app.parseBackup({ tabs: [], drinks: [{ name: 'x', rating: 50 }] }));
 });
 
+test('free label reading: ABV and volume only when unambiguous', () => {
+  const L = app.parseLabelText;
+  assert.deepStrictEqual(L('RIESLING TROCKEN\n2021\nalc. 12,5% vol  0,75 l ℮'), { abv: 12.5, volumeMl: 750, conflicting: false });
+  assert.deepStrictEqual(L('SINGLE MALT 40% Vol. 70cl'), { abv: 40, volumeMl: 700, conflicting: false });
+  assert.deepStrictEqual(L('Pils 4,9 % vol 500 ml'), { abv: 4.9, volumeMl: 500, conflicting: false });
+  assert.deepStrictEqual(L('ABV 5.2% 330ml can'), { abv: 5.2, volumeMl: 330, conflicting: false });
+  assert.deepStrictEqual(L('Alkoholgehalt: 13 %  1,5 L'), { abv: 13, volumeMl: 1500, conflicting: false });
+  // percentages not about alcohol are ignored, words starting with l are not liters
+  assert.deepStrictEqual(L('100% Malt, 70% Merlot, 12 lager beers'), { abv: null, volumeMl: null, conflicting: false });
+  // two different values -> unsure -> empty
+  assert.deepStrictEqual(L('13% vol ... 14,5% vol'), { abv: null, volumeMl: null, conflicting: true });
+  assert.deepStrictEqual(L(''), { abv: null, volumeMl: null, conflicting: false });
+  assert.deepStrictEqual(L(null), { abv: null, volumeMl: null, conflicting: false });
+});
+
 (async () => {
   // Same hashes as `git hash-object`
   assert.strictEqual(await app.gitBlobSha(new Uint8Array(0)), 'e69de29bb2d1d6434b8b29ae775ad8c2e48c5391');

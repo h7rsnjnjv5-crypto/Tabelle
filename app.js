@@ -5,6 +5,13 @@
 const AI_MODEL = 'claude-opus-5-5';
 const AI_TIMEOUT_MS = 120000;
 const LEAFLET_URL = 'https://unpkg.com/leaflet@1.9.4/dist/';
+/** Free on-device label reading (Tesseract.js). Downloaded once (~7 MB), then cached. */
+const OCR = {
+  script: 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js',
+  workerPath: 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/worker.min.js',
+  corePath: 'https://cdn.jsdelivr.net/npm/tesseract.js-core@5.1.1',
+  langPath: 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/eng@1.0.0/4.0.0_best_int',
+};
 
 /* =====================================================================
    Pure helpers (no DOM). Also loaded by test.js under Node.
@@ -473,6 +480,7 @@ function bindEvents() {
   $('#photoRemove').addEventListener('click', () => { state.formPhoto = null; state.formThumb = null; renderPhotoPreview(); });
   $('#deleteDrinkBtn').addEventListener('click', deleteDrink);
   $('#identifyBtn').addEventListener('click', identifyDrink);
+  $('#ocrBtn').addEventListener('click', readLabel);
   $('#fCategory').addEventListener('change', () => { state.categoryTouched = true; });
   // Editing an AI-filled field removes its highlight
   $('#drinkForm').addEventListener('input', (e) => {
@@ -808,7 +816,7 @@ function renderPhotoPreview() {
     box.replaceChildren(el('span', {}, 'No photo'));
   }
   $('#photoRemove').hidden = !state.formThumb;
-  $('#identifyBtn').hidden = !state.formPhoto;
+  $('#readButtons').hidden = !state.formPhoto;
 }
 
 /* ---------- Tabs management ---------- */
@@ -1611,6 +1619,8 @@ function resetAiUi() {
   $('#aiMsg').textContent = '';
   $('#aiSources').hidden = true;
   $('#aiSources').replaceChildren();
+  $('#ocrText').hidden = true;
+  $('#ocrText').open = false;
   document.querySelectorAll('#drinkForm .ai-filled').forEach((r) => r.classList.remove('ai-filled'));
 }
 
@@ -1624,13 +1634,19 @@ function showAiMsg(text, isError) {
 function setAiBusy(busy) {
   aiBusy = busy;
   const b = $('#identifyBtn');
-  b.disabled = busy;
   b.classList.toggle('busy', busy);
-  b.textContent = busy ? 'Identifying…' : '✨ Identify drink';
+  b.textContent = busy ? 'Identifying…' : '✨ Identify with AI';
+  updateReadButtons();
+}
+
+/** Only one of AI / free label reading runs at a time. */
+function updateReadButtons() {
+  $('#identifyBtn').disabled = aiBusy || ocrBusy;
+  $('#ocrBtn').disabled = aiBusy || ocrBusy;
 }
 
 async function identifyDrink() {
-  if (aiBusy || !state.formPhoto) return;
+  if (aiBusy || ocrBusy || !state.formPhoto) return;
   resetAiUi();
   if (!ai.key) {
     showAiMsg('Add your Anthropic API key in Settings to use this. You can still fill in the form manually.', true);
@@ -1706,6 +1722,123 @@ function renderAiSources(sources) {
   box.replaceChildren(el('span', {}, label),
     ...sources.map((s) => el('a', { href: s.url, target: '_blank', rel: 'noopener noreferrer' }, s.title)));
   box.hidden = false;
+}
+
+/* =====================================================================
+   Free label reading on the device (Tesseract.js text recognition).
+   Fills only values with an unambiguous pattern: ABV and volume.
+   ===================================================================== */
+
+/** Find ABV and bottle volume in recognised label text. Ambiguous → null. */
+function parseLabelText(text) {
+  const t = String(text || '').replace(/\s+/g, ' ');
+  const num = (s) => Number(s.replace(',', '.'));
+  const N = '(\\d{1,2}(?:[.,]\\d{1,2})?)';
+  // ABV only counts when the % is tied to "vol", "alc"/"alk" or "ABV" (not "100% Malt").
+  const abvPatterns = [
+    new RegExp(N + '\\s*%\\s*(?:vol|alc|alk|abv|by\\s*vol)', 'gi'),
+    new RegExp('(?:alc|alk|abv|alcohol|alkohol)\\.?[^0-9%]{0,15}' + N + '\\s*%', 'gi'),
+  ];
+  const abvs = new Set();
+  abvPatterns.forEach((re) => {
+    for (const m of t.matchAll(re)) {
+      const v = num(m[1]);
+      if (v > 0 && v <= 80) abvs.add(v);
+    }
+  });
+  const vols = new Set();
+  for (const m of t.matchAll(/(\d{1,4}(?:[.,]\d{1,3})?)\s*(ml|cl|ltr|liter|litre|l)(?![a-z])/gi)) {
+    const unit = m[2].toLowerCase();
+    const v = num(m[1]);
+    const ml = unit === 'ml' ? v : unit === 'cl' ? v * 10 : v * 1000;
+    if (ml >= 20 && ml <= 5000) vols.add(Math.round(ml));
+  }
+  return {
+    abv: abvs.size === 1 ? [...abvs][0] : null,
+    volumeMl: vols.size === 1 ? [...vols][0] : null,
+    conflicting: abvs.size > 1 || vols.size > 1,
+  };
+}
+
+let ocrBusy = false;
+let ocrWorkerPromise = null;
+let ocrProgress = null; // set while reading, receives Tesseract progress messages
+
+function loadScript(src) {
+  return new Promise((resolve, reject) => {
+    if (document.querySelector(`script[src="${src}"]`) && window.Tesseract) return resolve();
+    const s = el('script', { src });
+    s.onload = () => resolve();
+    s.onerror = () => { s.remove(); reject(new Error('Text recognition could not be loaded.')); };
+    document.head.append(s);
+  });
+}
+
+function getOcrWorker() {
+  if (!ocrWorkerPromise) {
+    ocrWorkerPromise = loadScript(OCR.script).then(() => window.Tesseract.createWorker('eng', 1, {
+      workerPath: OCR.workerPath,
+      corePath: OCR.corePath,
+      langPath: OCR.langPath,
+      logger: (m) => { if (ocrProgress) ocrProgress(m); },
+    }));
+    ocrWorkerPromise.catch(() => { ocrWorkerPromise = null; }); // allow a retry later
+  }
+  return ocrWorkerPromise;
+}
+
+function withTimeout(promise, ms, message) {
+  let timer;
+  return Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(message)), ms); })])
+    .finally(() => clearTimeout(timer));
+}
+
+function setOcrBusy(busy, label) {
+  ocrBusy = busy;
+  const b = $('#ocrBtn');
+  b.classList.toggle('busy', busy);
+  b.textContent = busy ? (label || 'Reading…') : 'Read label (free)';
+  updateReadButtons();
+}
+
+async function readLabel() {
+  if (ocrBusy || aiBusy || !state.formPhoto) return;
+  resetAiUi();
+  const editingId = state.editingId;
+  const photo = state.formPhoto;
+  setOcrBusy(true, 'Loading…');
+  ocrProgress = (m) => {
+    if (m.status === 'recognizing text') $('#ocrBtn').textContent = `Reading… ${Math.round((m.progress || 0) * 100)}%`;
+    else if (/loading/.test(m.status || '')) $('#ocrBtn').textContent = 'Loading…';
+  };
+  try {
+    const worker = await withTimeout(getOcrWorker(), 120000, 'Loading text recognition timed out.');
+    const { data } = await withTimeout(worker.recognize(photo), 60000, 'Reading the label took too long.');
+    if (!$('#drinkDialog').open || state.editingId !== editingId || state.formPhoto !== photo) return;
+    const r = parseLabelText(data.text);
+    const filled = applyAiSuggestions({
+      name: null, brand: null, category: null, abv: r.abv, volumeMl: r.volumeMl, country: null, region: null, description: null,
+    });
+    const text = (data.text || '').trim();
+    if (text) {
+      $('#ocrTextBody').textContent = text;
+      $('#ocrText').hidden = false;
+    }
+    let msg = filled.length
+      ? `Filled: ${filled.join(', ')}. Please check the highlighted fields.`
+      : (r.abv !== null || r.volumeMl !== null
+        ? `Found ${[r.abv !== null ? 'ABV' : null, r.volumeMl !== null ? 'volume' : null].filter(Boolean).join(' and ')}, but you had already filled it in – kept yours.`
+        : 'No clear ABV or volume found on the label.');
+    if (r.conflicting) msg += ' Some values were ambiguous and left empty.';
+    if (text) msg += ' Name and producer: copy them from the recognized text below.';
+    else msg += ' No text recognized – try a sharper, closer photo of the label.';
+    showAiMsg(msg, false);
+  } catch (err) {
+    showAiMsg(err.message + ' The first use needs an internet connection; after that it works offline.', true);
+  } finally {
+    ocrProgress = null;
+    setOcrBusy(false);
+  }
 }
 
 /* =====================================================================
@@ -2014,6 +2147,6 @@ function registerServiceWorker() {
 
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = { parseNumber, roundMoney, toLiters, calcPrices, validateDrink, applyView, pickBestValue, validateTabName, parseBackup, fallbackTabId, gitBlobSha, bytesToBase64, drinkToRemote,
-    sanitizeAiResult, extractJson, findCountry, drinkPosition, groupForMap, countCountries, geoQueryFor, AI_MODEL };
+    sanitizeAiResult, extractJson, parseLabelText, findCountry, drinkPosition, groupForMap, countCountries, geoQueryFor, AI_MODEL };
 }
 if (typeof document !== 'undefined') init();

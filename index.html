@@ -152,9 +152,16 @@
             </div>
           </div>
           <small id="photoBusy" class="hint" hidden>Processing image…</small>
-          <button type="button" id="identifyBtn" class="fill-btn" hidden>✨ Identify drink</button>
+          <div id="readButtons" class="read-buttons" hidden>
+            <button type="button" id="ocrBtn" class="pill-btn">Read label (free)</button>
+            <button type="button" id="identifyBtn" class="fill-btn">✨ Identify with AI</button>
+          </div>
           <p id="aiMsg" class="hint" aria-live="polite" hidden></p>
           <div id="aiSources" class="sources" hidden></div>
+          <details id="ocrText" class="ocr-text" hidden>
+            <summary>Recognized text (select to copy)</summary>
+            <pre id="ocrTextBody"></pre>
+          </details>
           <input id="photoCamera" type="file" accept="image/*" capture="environment" hidden>
           <input id="photoGallery" type="file" accept="image/*" hidden>
         </div>

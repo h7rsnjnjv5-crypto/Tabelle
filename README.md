@@ -23,7 +23,16 @@ python3 -m http.server 8000      # or: npx serve .
 Data lives in the browser of that device. Use **Settings → Export JSON** regularly as a backup;
 **Import JSON** restores it (replaces the current data). Backups from older versions still import.
 
-## Identify drinks with AI (optional)
+## Read label (free, on your phone)
+After adding a photo, tap **Read label (free)**. Text recognition (Tesseract.js) runs on the device –
+no account, no API key, no cost. The first use downloads about 7 MB (needs internet), after that it works offline.
+- It fills only **ABV** (e.g. "12,5 % vol", "Alc. 40%") and **volume** (e.g. "0,75 l", "70cl", "330 ml"),
+  and only when exactly one clear value is found. Other percentages like "100% Malt" are ignored.
+- Name and producer are not guessed: the recognized text is shown so you can select and copy it.
+- Only empty fields are filled and highlighted; nothing is saved until you tap Save.
+- Works best with a sharp, close, straight photo of the label. Curved or stylised labels may be misread – then fields stay empty.
+
+## Identify drinks with AI (optional, paid)
 Take or choose a photo, then tap **Identify drink**. The photo is sent to the Anthropic API, which reads
 the label and returns name, producer, category, ABV, volume, country, region and a short description.
 - Values it cannot read are left empty – it is told never to guess, and the app re-checks every value.

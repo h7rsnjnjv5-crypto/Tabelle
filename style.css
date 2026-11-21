@@ -209,8 +209,8 @@ a { color: var(--accent); }
 .frow input[aria-invalid="true"] { color: var(--red); }
 .frow.ai-filled { background: var(--ai); box-shadow: -16px 0 0 var(--ai); }
 .frow.ai-filled::after {
-  content: "AI"; position: absolute; left: -12px; top: 50%; transform: translateY(-50%);
-  font-size: 9px; font-weight: 700; color: var(--accent);
+  content: ""; position: absolute; left: -10px; top: 50%; transform: translateY(-50%);
+  width: 6px; height: 6px; border-radius: 50%; background: var(--accent);
 }
 .frow.calc strong { margin-left: auto; font-weight: 600; font-variant-numeric: tabular-nums; }
 .frow.calc span { color: var(--label-2); }
@@ -387,12 +387,21 @@ dialog::backdrop { background: rgba(0, 0, 0, .4); }
   font-size: 17px; font-weight: 600; cursor: pointer;
 }
 .fill-btn:disabled { opacity: .6; }
-.fill-btn:active, .pill-btn:active { opacity: .7; }
-.fill-btn.busy::before {
+.read-buttons { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.read-buttons .fill-btn, .read-buttons .pill-btn { min-height: 50px; font-size: 15px; padding: 0 8px; }
+.pill-btn.busy::before, .fill-btn.busy::before {
   content: ""; display: inline-block; width: 14px; height: 14px; margin-right: 8px; vertical-align: -2px;
-  border: 2px solid rgba(255, 255, 255, .5); border-top-color: #fff; border-radius: 50%;
+  border: 2px solid currentColor; border-top-color: transparent; border-radius: 50%;
   animation: spin .8s linear infinite;
 }
+.ocr-text { font-size: 13px; color: var(--label-2); }
+.ocr-text summary { min-height: 32px; display: flex; align-items: center; cursor: pointer; color: var(--accent); }
+.ocr-text pre {
+  margin: 4px 0 0; padding: 10px; border-radius: 8px; background: var(--fill); color: var(--label);
+  white-space: pre-wrap; word-break: break-word; font: 13px/1.4 ui-monospace, Menlo, monospace;
+  max-height: 180px; overflow: auto; user-select: text; -webkit-user-select: text;
+}
+.fill-btn:active, .pill-btn:active { opacity: .7; }
 @keyframes spin { to { transform: rotate(360deg); } }
 .hint { margin: 0; font-size: 13px; color: var(--label-2); line-height: 1.35; }
 .hint.error { color: var(--red); }

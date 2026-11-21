@@ -1,7 +1,7 @@
 /* Service worker: keeps the app shell available offline.
    Own files: network first (updates arrive immediately), cache as fallback.
-   Map library from the CDN: cache first. Everything else (APIs, map tiles) is not touched. */
-const CACHE = 'drink-tracker-v2';
+   Map + text-recognition libraries from CDNs: cache first. Everything else (APIs, map tiles) is not touched. */
+const CACHE = 'drink-tracker-v3';
 const SHELL = [
   './', './index.html', './style.css', './app.js', './manifest.webmanifest',
   './icons/icon-192.png', './icons/icon-512.png', './icons/apple-touch-icon.png',
@@ -33,7 +33,9 @@ self.addEventListener('fetch', (e) => {
     return;
   }
 
-  if (url.hostname === 'unpkg.com' && url.pathname.startsWith('/leaflet@')) {
+  const isLib = (url.hostname === 'unpkg.com' && url.pathname.startsWith('/leaflet@')) ||
+    (url.hostname === 'cdn.jsdelivr.net' && /^\/npm\/(tesseract\.js|@tesseract\.js-data)/.test(url.pathname));
+  if (isLib) {
     e.respondWith(caches.match(req).then((hit) => hit || fetch(req).then((res) => {
       if (res.ok) { const copy = res.clone(); caches.open(CACHE).then((c) => c.put(req, copy)); }
       return res;
