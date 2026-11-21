@@ -106,4 +106,19 @@ test('backup parsing keeps drinks whose tab is missing', () => {
   assert.throws(() => app.parseBackup({ tabs: [], drinks: [{ name: 'x', rating: 50 }] }));
 });
 
-console.log(`\nAll ${passed} tests passed.`);
+(async () => {
+  // Same hashes as `git hash-object`
+  assert.strictEqual(await app.gitBlobSha(new Uint8Array(0)), 'e69de29bb2d1d6434b8b29ae775ad8c2e48c5391');
+  assert.strictEqual(await app.gitBlobSha(new TextEncoder().encode('hello\n')), 'ce013625030ba8dba906f756967f9e9ca394464a');
+  passed++;
+  console.log('✓ git blob hash matches git');
+
+  assert.strictEqual(app.bytesToBase64(new TextEncoder().encode('Grüner Veltliner')), Buffer.from('Grüner Veltliner').toString('base64'));
+  const remote = app.drinkToRemote({ id: 'x', name: 'A', photo: {}, thumb: {}, rating: 5 });
+  assert.strictEqual(remote.hasPhoto, true);
+  assert.ok(!('photo' in remote) && !('thumb' in remote));
+  passed++;
+  console.log('✓ GitHub file format (no blobs, UTF-8 safe)');
+
+  console.log(`\nAll ${passed} tests passed.`);
+})();

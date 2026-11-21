@@ -18,6 +18,8 @@
     </div>
   </header>
 
+  <button id="syncStatus" class="sync-status" type="button" hidden></button>
+
   <!-- Category tabs (rendered by app.js) -->
   <nav id="tabs" class="tabs" aria-label="Categories"></nav>
 
@@ -201,13 +203,41 @@
         <input id="currency" type="text" maxlength="5" autocomplete="off">
       </div>
       <h3>Backup</h3>
-      <p class="muted">Data lives only in this browser. Export regularly to keep a copy (photos included).</p>
+      <p class="muted">Data is stored in this browser. Export regularly to keep a copy (photos included).</p>
       <div class="btn-row">
         <button type="button" id="exportBtn" class="btn">⬇ Export JSON</button>
         <button type="button" id="importBtn" class="btn">⬆ Import JSON</button>
         <input id="importFile" type="file" accept="application/json,.json" hidden>
       </div>
       <p class="muted">Import replaces all current data.</p>
+
+      <h3>Save to GitHub</h3>
+      <p class="muted">Saves every entry (and its photo) automatically to a GitHub repository, on its own branch.
+        If the repository is <strong>public, anyone can see your drinks and photos</strong> – use a private repository for private data.</p>
+      <div class="field">
+        <label for="ghRepo">Repository (owner/name)</label>
+        <input id="ghRepo" type="text" placeholder="owner/repository" autocomplete="off" autocapitalize="off" spellcheck="false">
+      </div>
+      <div class="field">
+        <label for="ghBranch">Branch for the data</label>
+        <input id="ghBranch" type="text" placeholder="data" autocomplete="off" autocapitalize="off" spellcheck="false">
+      </div>
+      <div class="field">
+        <label for="ghToken">Access token</label>
+        <input id="ghToken" type="password" autocomplete="off" spellcheck="false">
+        <small class="muted">A fine-grained token for this repository only, with “Contents: Read and write”.
+          <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">Create a token</a>.
+          It is stored only on this device and never exported.</small>
+      </div>
+      <div class="btn-row">
+        <button type="button" id="ghConnect" class="btn primary">Save &amp; connect</button>
+        <span id="ghConnected" class="btn-row" hidden>
+          <button type="button" id="ghUploadAll" class="btn">Upload everything</button>
+          <button type="button" id="ghRestore" class="btn">Restore from GitHub</button>
+          <button type="button" id="ghDisconnect" class="btn ghost danger">Disconnect</button>
+        </span>
+      </div>
+      <p id="ghMsg" class="muted" aria-live="polite"></p>
     </div>
   </dialog>
 

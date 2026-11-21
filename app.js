@@ -173,7 +173,8 @@ function parseBackup(data) {
     const { errors, values } = validateDrink(raw);
     const keys = Object.keys(errors);
     if (keys.length) throw new Error(`Drink #${i + 1} (“${d.name || '?'}”): ${errors[keys[0]]}`);
-    const isImg = (s) => typeof s === 'string' && s.startsWith('data:image/');
+    const isImg = (s) => (typeof s === 'string' && s.startsWith('data:image/')) ||
+      (typeof Blob !== 'undefined' && s instanceof Blob);
     return Object.assign(values, {
       id: typeof d.id === 'string' && d.id ? d.id : uid(),
       photo: isImg(d.photo) ? d.photo : null,
@@ -343,6 +344,7 @@ async function init() {
   try {
     db = await openDb();
     await loadAll();
+    await loadSyncConfig();
   } catch (err) {
     document.body.prepend(el('p', { class: 'err' }, 'Could not open local storage: ' + err.message));
     return;
@@ -351,7 +353,10 @@ async function init() {
   if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
   buildStaticUi();
   bindEvents();
+  bindSyncEvents();
   renderAll();
+  renderSyncStatus();
+  if (syncEnabled() && queueSize() > 0) runSync(); // finish uploads from last time
 }
 
 async function loadAll() {
@@ -657,6 +662,7 @@ async function saveDrink(e) {
   state.drinks = existing ? state.drinks.map((d) => (d.id === drink.id ? drink : d)) : [...state.drinks, drink];
   $('#drinkDialog').close();
   renderAll();
+  queueSync({ drinkIds: [drink.id] });
 }
 
 async function deleteDrink() {
@@ -671,6 +677,7 @@ async function deleteDrink() {
   state.drinks = state.drinks.filter((x) => x.id !== d.id);
   $('#drinkDialog').close();
   renderAll();
+  queueSync({ drinkIds: [d.id] });
 }
 
 async function onPhotoChosen(input) {
@@ -744,6 +751,7 @@ async function renameTab(id, input) {
   try { await putAll('tabs', [updated]); } catch (e) { $('#tabError').textContent = 'Could not save: ' + e.message; return; }
   state.tabs = state.tabs.map((t) => (t.id === id ? updated : t));
   renderAll();
+  queueSync({ config: true });
 }
 
 async function addTab(e) {
@@ -759,6 +767,7 @@ async function addTab(e) {
   $('#tabError').textContent = '';
   renderTabsDialog();
   renderAll();
+  queueSync({ config: true });
 }
 
 function openDeleteTab(id) {
@@ -801,12 +810,15 @@ async function confirmDeleteTab() {
   $('#deleteTabDialog').close();
   renderTabsDialog();
   renderAll();
+  queueSync({ config: true, drinkIds: moved.map((d) => d.id) });
 }
 
 /* ---------- Settings, export, import ---------- */
 
 function openSettings() {
   $('#currency').value = state.settings.currency;
+  $('#ghMsg').textContent = '';
+  fillSyncForm();
   $('#settingsDialog').showModal();
 }
 
@@ -816,6 +828,7 @@ async function saveCurrency() {
   try { await putAll('meta', [{ key: 'settings', currency: value }]); } catch (e) { alert('Could not save: ' + e.message); return; }
   state.settings.currency = value;
   renderList();
+  queueSync({ config: true });
 }
 
 async function exportData() {
@@ -847,31 +860,375 @@ async function importData(file) {
   }
   if (!confirm(`Import ${parsed.drinks.length} drinks and ${parsed.tabs.length} tabs?\n\nThis REPLACES all current data. Export first if you want to keep it.`)) return;
   try {
-    // Convert photos before opening the transaction (it must not wait on async work).
-    parsed.drinks.forEach((d) => {
-      d.photo = d.photo ? dataUrlToBlob(d.photo) : null;
-      d.thumb = d.thumb ? dataUrlToBlob(d.thumb) : null;
-    });
-    const t = db.transaction(['tabs', 'drinks', 'meta'], 'readwrite');
-    ['tabs', 'drinks', 'meta'].forEach((s) => t.objectStore(s).clear());
-    parsed.tabs.forEach((x) => t.objectStore('tabs').put(x));
-    parsed.drinks.forEach((x) => t.objectStore('drinks').put(x));
-    t.objectStore('meta').put({ key: 'settings', currency: parsed.settings.currency });
-    await txDone(t);
-    await loadAll();
+    await replaceAllData(parsed);
   } catch (err) {
     alert('Import failed, nothing was changed: ' + err.message);
     return;
   }
-  state.tab = ALL;
   $('#settingsDialog').close();
-  renderAll();
   alert('Import complete.');
+  if (syncEnabled()) uploadEverything({ mirror: true }); // make GitHub match the imported data
+}
+
+/** Replace all local tabs, drinks and settings in one transaction (sync config is kept). */
+async function replaceAllData(parsed) {
+  // Convert photos before opening the transaction (it must not wait on async work).
+  for (const d of parsed.drinks) {
+    if (typeof d.photo === 'string') d.photo = dataUrlToBlob(d.photo);
+    if (typeof d.thumb === 'string') d.thumb = dataUrlToBlob(d.thumb);
+    if (d.photo && (!d.thumb || d.thumb === d.photo)) d.thumb = await resizeImage(d.photo, 320, 0.8);
+    if (!d.photo) d.thumb = null;
+  }
+  const t = db.transaction(['tabs', 'drinks', 'meta'], 'readwrite');
+  ['tabs', 'drinks'].forEach((s) => t.objectStore(s).clear());
+  parsed.tabs.forEach((x) => t.objectStore('tabs').put(x));
+  parsed.drinks.forEach((x) => t.objectStore('drinks').put(x));
+  t.objectStore('meta').put({ key: 'settings', currency: parsed.settings.currency });
+  await txDone(t);
+  await loadAll();
+  state.tab = ALL;
+  renderAll();
+}
+
+/* =====================================================================
+   GitHub sync: every change is saved as files in a GitHub repository.
+   drinks/<id>.json, photos/<id>.jpg, config.json (tabs + settings).
+   Pending changes are queued in IndexedDB and retried, so nothing is
+   lost while offline. The token is stored only on this device.
+   ===================================================================== */
+
+const sync = {
+  cfg: { repo: '', branch: 'data', token: '' },
+  queue: { config: false, drinks: {} }, // drinks: id -> change counter
+  running: false,
+  branchReady: false,
+  error: '',
+  retryTimer: null,
+};
+
+function syncEnabled() {
+  return Boolean(sync.cfg.repo && sync.cfg.token);
+}
+
+function queueSize() {
+  return Object.keys(sync.queue.drinks).length + (sync.queue.config ? 1 : 0);
+}
+
+function saveQueue() {
+  return putAll('meta', [Object.assign({ key: 'syncQueue' }, sync.queue)]);
+}
+
+/** Mark things as changed and start uploading. Safe to call when sync is off. */
+async function queueSync({ config = false, drinkIds = [] }) {
+  if (!syncEnabled()) return;
+  if (config) sync.queue.config = true;
+  drinkIds.forEach((id) => { sync.queue.drinks[id] = (sync.queue.drinks[id] || 0) + 1; });
+  renderSyncStatus();
+  try { await saveQueue(); } catch (e) { /* queue stays in memory */ }
+  runSync();
+}
+
+/** Upload queued changes one by one until the queue is empty. */
+async function runSync() {
+  if (!syncEnabled() || sync.running) return;
+  clearTimeout(sync.retryTimer);
+  sync.running = true;
+  sync.error = '';
+  renderSyncStatus();
+  try {
+    await ensureBranch();
+    while (queueSize() > 0) {
+      if (sync.queue.config) {
+        sync.queue.config = false;
+        try {
+          await putFile('config.json', jsonBytes(remoteConfig()), 'Update tabs and settings');
+        } catch (e) { sync.queue.config = true; throw e; }
+      } else {
+        const id = Object.keys(sync.queue.drinks)[0];
+        const version = sync.queue.drinks[id];
+        await syncDrink(id);
+        // Only drop it if it wasn't changed again while uploading.
+        if (sync.queue.drinks[id] === version) delete sync.queue.drinks[id];
+      }
+      await saveQueue();
+      renderSyncStatus();
+    }
+  } catch (err) {
+    sync.error = err.message;
+    sync.retryTimer = setTimeout(runSync, 60000);
+  } finally {
+    sync.running = false;
+    renderSyncStatus();
+  }
+  if (!sync.error && queueSize() > 0) runSync();
+}
+
+async function syncDrink(id) {
+  const d = state.drinks.find((x) => x.id === id);
+  if (d) {
+    await putFile(`drinks/${id}.json`, jsonBytes(drinkToRemote(d)), `Save drink “${d.name}”`);
+    if (d.photo) await putFile(`photos/${id}.jpg`, new Uint8Array(await d.photo.arrayBuffer()), `Save photo of “${d.name}”`);
+    else await deleteFile(`photos/${id}.jpg`, 'Remove photo');
+  } else {
+    await deleteFile(`drinks/${id}.json`, 'Delete drink');
+    await deleteFile(`photos/${id}.jpg`, 'Delete photo');
+  }
+}
+
+/** Drink as stored on GitHub (photo lives in its own file). */
+function drinkToRemote(d) {
+  const out = {};
+  ['id', 'name', 'tabId', 'brand', 'notes', 'rating', 'price', 'volume', 'volumeUnit', 'abv', 'createdAt', 'updatedAt']
+    .forEach((k) => { out[k] = d[k] === undefined ? null : d[k]; });
+  out.hasPhoto = Boolean(d.photo);
+  return out;
+}
+
+function remoteConfig() {
+  return { app: 'drink-tracker', version: 1, settings: { currency: state.settings.currency }, tabs: state.tabs };
+}
+
+function jsonBytes(obj) {
+  return new TextEncoder().encode(JSON.stringify(obj, null, 2) + '\n');
+}
+
+function bytesToBase64(bytes) {
+  let s = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+
+/** Git's blob hash, used to skip uploads of unchanged files. */
+async function gitBlobSha(bytes) {
+  if (!(globalThis.crypto && crypto.subtle)) return null;
+  const head = new TextEncoder().encode(`blob ${bytes.length}\0`);
+  const all = new Uint8Array(head.length + bytes.length);
+  all.set(head);
+  all.set(bytes, head.length);
+  const hash = new Uint8Array(await crypto.subtle.digest('SHA-1', all));
+  return Array.from(hash, (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+/** Call the GitHub REST API. */
+async function gh(method, path, { body, raw, allow404 } = {}) {
+  let res;
+  try {
+    res = await fetch('https://api.github.com' + path, {
+      method,
+      cache: 'no-store',
+      headers: Object.assign({
+        Authorization: 'Bearer ' + sync.cfg.token,
+        Accept: raw ? 'application/vnd.github.raw+json' : 'application/vnd.github+json',
+      }, body ? { 'Content-Type': 'application/json' } : {}),
+      body: body ? JSON.stringify(body) : undefined,
+    });
+  } catch (e) {
+    throw new Error('No connection to GitHub.');
+  }
+  if (res.status === 404 && allow404) return null;
+  if (!res.ok) {
+    let msg = '';
+    try { msg = (await res.json()).message || ''; } catch (e) { /* no JSON body */ }
+    if (res.status === 401) throw new Error('The token is invalid or expired.');
+    if (res.status === 404) throw new Error('Repository not found, or the token has no access to it.');
+    if (res.status === 403) throw new Error('The token is not allowed to write to this repository. ' + msg);
+    throw new Error(`GitHub error ${res.status}: ${msg}`);
+  }
+  if (raw) return res;
+  return res.status === 204 ? null : res.json();
+}
+
+function contentsPath(path) {
+  return `/repos/${sync.cfg.repo}/contents/${path}?ref=${encodeURIComponent(sync.cfg.branch)}`;
+}
+
+async function remoteSha(path) {
+  const r = await gh('GET', contentsPath(path), { allow404: true });
+  return r && !Array.isArray(r) ? r.sha : null;
+}
+
+async function putFile(path, bytes, message) {
+  const sha = await remoteSha(path);
+  if (sha && sha === await gitBlobSha(bytes)) return; // unchanged
+  await gh('PUT', `/repos/${sync.cfg.repo}/contents/${path}`, {
+    body: { message, content: bytesToBase64(bytes), branch: sync.cfg.branch, sha: sha || undefined },
+  });
+}
+
+async function deleteFile(path, message) {
+  const sha = await remoteSha(path);
+  if (!sha) return;
+  await gh('DELETE', `/repos/${sync.cfg.repo}/contents/${path}`, { body: { message, sha, branch: sync.cfg.branch } });
+}
+
+/** Create the data branch from the default branch if it does not exist yet. */
+async function ensureBranch() {
+  if (sync.branchReady) return;
+  const branch = encodeURIComponent(sync.cfg.branch);
+  const ref = await gh('GET', `/repos/${sync.cfg.repo}/git/ref/heads/${branch}`, { allow404: true });
+  if (!ref) {
+    const repo = await gh('GET', `/repos/${sync.cfg.repo}`);
+    const base = await gh('GET', `/repos/${sync.cfg.repo}/git/ref/heads/${encodeURIComponent(repo.default_branch)}`, { allow404: true });
+    if (!base) throw new Error('The repository is empty. Add any file (e.g. a README) on GitHub first.');
+    await gh('POST', `/repos/${sync.cfg.repo}/git/refs`, { body: { ref: `refs/heads/${sync.cfg.branch}`, sha: base.object.sha } });
+  }
+  sync.branchReady = true;
+}
+
+async function listRemoteDrinkIds() {
+  const list = await gh('GET', contentsPath('drinks'), { allow404: true });
+  return (Array.isArray(list) ? list : [])
+    .filter((f) => f.type === 'file' && f.name.endsWith('.json'))
+    .map((f) => f.name.slice(0, -5));
+}
+
+/** Queue every local drink. With mirror=true, drinks on GitHub that are not on
+ *  this device are deleted there too (only used after a JSON import). */
+async function uploadEverything({ mirror = false } = {}) {
+  let remoteIds = [];
+  if (mirror) {
+    try { await ensureBranch(); remoteIds = await listRemoteDrinkIds(); } catch (e) { /* runSync reports errors */ }
+  }
+  const ids = new Set([...state.drinks.map((d) => d.id), ...remoteIds]);
+  await queueSync({ config: true, drinkIds: [...ids] });
+}
+
+/** Download everything from GitHub and replace the local data. */
+async function restoreFromGitHub(askFirst = true) {
+  const msg = $('#ghMsg');
+  try {
+    msg.textContent = 'Downloading from GitHub…';
+    await ensureBranch();
+    const cfgRes = await gh('GET', contentsPath('config.json'), { raw: true, allow404: true });
+    if (!cfgRes) throw new Error('No saved data found in this repository/branch.');
+    const cfg = await cfgRes.json();
+    const ids = await listRemoteDrinkIds();
+    const drinks = [];
+    for (const id of ids) {
+      msg.textContent = `Downloading drink ${drinks.length + 1} of ${ids.length}…`;
+      const d = await (await gh('GET', contentsPath(`drinks/${id}.json`), { raw: true })).json();
+      if (d.hasPhoto) {
+        const p = await gh('GET', contentsPath(`photos/${id}.jpg`), { raw: true, allow404: true });
+        d.photo = p ? new Blob([await p.arrayBuffer()], { type: 'image/jpeg' }) : null;
+      }
+      drinks.push(d);
+    }
+    const parsed = parseBackup({ tabs: cfg.tabs || [], settings: cfg.settings, drinks });
+    msg.textContent = '';
+    if (askFirst && !confirm(`Restore ${parsed.drinks.length} drinks and ${parsed.tabs.length} tabs from GitHub?\n\nThis REPLACES the data on this device.`)) return;
+    await replaceAllData(parsed);
+    sync.queue = { config: false, drinks: {} }; // local now equals remote
+    await saveQueue();
+    renderSyncStatus();
+    msg.textContent = 'Restore complete.';
+  } catch (err) {
+    msg.textContent = 'Restore failed: ' + err.message;
+  }
+}
+
+/** Suggest owner/repo when the app is hosted on GitHub Pages. */
+function guessRepo() {
+  const host = location.hostname;
+  if (!host.endsWith('.github.io')) return '';
+  const owner = host.split('.')[0];
+  const repo = location.pathname.split('/')[1] || host;
+  return `${owner}/${repo}`;
+}
+
+async function loadSyncConfig() {
+  const meta = await getAll('meta');
+  const cfg = meta.find((m) => m.key === 'sync');
+  const queue = meta.find((m) => m.key === 'syncQueue');
+  if (cfg) sync.cfg = { repo: cfg.repo || '', branch: cfg.branch || 'data', token: cfg.token || '' };
+  if (queue) sync.queue = { config: Boolean(queue.config), drinks: queue.drinks || {} };
+}
+
+function fillSyncForm() {
+  $('#ghRepo').value = sync.cfg.repo || guessRepo();
+  $('#ghBranch').value = sync.cfg.branch || 'data';
+  $('#ghToken').value = sync.cfg.token;
+  $('#ghConnected').hidden = !syncEnabled();
+}
+
+async function connectGitHub() {
+  const msg = $('#ghMsg');
+  const repo = $('#ghRepo').value.trim().replace(/^https:\/\/github\.com\//, '').replace(/\/$/, '');
+  const branch = $('#ghBranch').value.trim() || 'data';
+  const token = $('#ghToken').value.trim();
+  if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) { msg.textContent = 'Enter the repository as owner/name.'; return; }
+  if (!token) { msg.textContent = 'Enter an access token.'; return; }
+  const firstTime = !syncEnabled() || sync.cfg.repo !== repo || sync.cfg.branch !== branch;
+  const previous = sync.cfg;
+  sync.cfg = { repo, branch, token };
+  sync.branchReady = false;
+  msg.textContent = 'Connecting…';
+  try {
+    const info = await gh('GET', `/repos/${repo}`);
+    if (info.permissions && !info.permissions.push) throw new Error('The token can read but not write this repository.');
+    await ensureBranch();
+    await putAll('meta', [{ key: 'sync', repo, branch, token }]);
+    msg.textContent = `Connected to ${repo} (branch “${branch}”).` + (info.private ? '' : ' Note: this repository is PUBLIC.');
+    fillSyncForm();
+    if (firstTime) {
+      const remoteIds = await listRemoteDrinkIds();
+      if (remoteIds.length && confirm(`GitHub already has ${remoteIds.length} saved drinks.\n\nOK = load them onto this device (replaces the data here).\nCancel = keep the data here and add it to GitHub.`)) {
+        await restoreFromGitHub(false);
+        renderSyncStatus();
+        return;
+      }
+      await uploadEverything();
+    } else {
+      runSync();
+    }
+  } catch (err) {
+    sync.cfg = previous; // keep the old working connection (if any) and what was typed
+    sync.branchReady = false;
+    msg.textContent = 'Could not connect: ' + err.message;
+  }
+  renderSyncStatus();
+}
+
+async function disconnectGitHub() {
+  if (!confirm('Stop saving to GitHub on this device? Data already on GitHub stays there.')) return;
+  sync.cfg = { repo: '', branch: 'data', token: '' };
+  sync.queue = { config: false, drinks: {} };
+  sync.branchReady = false;
+  clearTimeout(sync.retryTimer);
+  await putAll('meta', [{ key: 'sync', repo: '', branch: 'data', token: '' }]);
+  await saveQueue();
+  fillSyncForm();
+  $('#ghMsg').textContent = 'Disconnected.';
+  renderSyncStatus();
+}
+
+function renderSyncStatus() {
+  const b = $('#syncStatus');
+  if (!b) return;
+  b.hidden = !syncEnabled();
+  b.classList.toggle('error', Boolean(sync.error));
+  const n = queueSize();
+  if (sync.error) b.textContent = `⚠ Not saved to GitHub (${n}) – tap to retry`;
+  else if (n > 0) b.textContent = `☁ Saving to GitHub… (${n})`;
+  else b.textContent = '☁ Saved to GitHub';
+  b.title = sync.error || '';
+}
+
+function bindSyncEvents() {
+  $('#ghConnect').addEventListener('click', connectGitHub);
+  $('#ghDisconnect').addEventListener('click', disconnectGitHub);
+  $('#ghUploadAll').addEventListener('click', async () => {
+    $('#ghMsg').textContent = 'Uploading everything…';
+    await uploadEverything();
+    $('#ghMsg').textContent = sync.error ? 'Upload failed: ' + sync.error : 'Upload started – see status at the top.';
+  });
+  $('#ghRestore').addEventListener('click', () => restoreFromGitHub(true));
+  $('#syncStatus').addEventListener('click', () => { if (sync.error) runSync(); else openSettings(); });
+  window.addEventListener('online', runSync);
 }
 
 /* ---------- Boot ---------- */
 
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { parseNumber, roundMoney, toLiters, calcPrices, validateDrink, applyView, pickBestValue, validateTabName, parseBackup, fallbackTabId };
+  module.exports = { parseNumber, roundMoney, toLiters, calcPrices, validateDrink, applyView, pickBestValue, validateTabName, parseBackup, fallbackTabId, gitBlobSha, bytesToBase64, drinkToRemote };
 }
 if (typeof document !== 'undefined') init();
