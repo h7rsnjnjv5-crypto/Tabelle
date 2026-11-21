@@ -11,9 +11,9 @@
   "abv": 5,
   "country": "Deutschland",
   "region": "Bamberg",
-  "lat": null,
-  "lng": null,
-  "geoQuery": null,
+  "lat": 49.8916044,
+  "lng": 10.8868478,
+  "geoQuery": "Bamberg, Deutschland",
   "createdAt": 1795290172758,
   "updatedAt": 1795290172758,
   "hasPhoto": false
