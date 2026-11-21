@@ -11,9 +11,9 @@
   "abv": 40,
   "country": "Sweden",
   "region": "Stockholm",
-  "lat": null,
-  "lng": null,
-  "geoQuery": null,
+  "lat": 59.3251172,
+  "lng": 18.0710935,
+  "geoQuery": "Stockholm, Sweden",
   "createdAt": 1795290941215,
   "updatedAt": 1795290941215,
   "hasPhoto": false
